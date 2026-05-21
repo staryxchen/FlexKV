@@ -58,6 +58,17 @@ __global__ void transfer_kv_blocks_kernel(
 
     for (int64_t idx = lane_id; idx < copy_size_in_float4; idx += 32) {
       float4 element;
+#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__) || defined(FLEXKV_BACKEND_ROCM)
+      // ROCm fallback: plain vectorized float4 load/store.
+      // The NVIDIA path uses NVPTX inline asm (`ld.global.nc` non-coherent
+      // load + `st.global.cg` cache-global store) purely as cache hints;
+      // they are NVPTX-only constraints (`=f`, `l`) and hipify-perl does
+      // not translate inline PTX. The plain pointer dereference below is
+      // functionally equivalent — we just lose the cache-hint micro-opt.
+      element = *reinterpret_cast<const float4 *>(
+          &FLOAT4_PTR(src_chunk_ptr)[idx]);
+      *reinterpret_cast<float4 *>(&FLOAT4_PTR(dst_chunk_ptr)[idx]) = element;
+#else
       asm volatile("ld.global.nc.v4.f32 {%0,%1,%2,%3},[%4];"
                    : "=f"(element.x), "=f"(element.y), "=f"(element.z),
                      "=f"(element.w)
@@ -68,6 +79,7 @@ __global__ void transfer_kv_blocks_kernel(
                    "f"(element.x), "f"(element.y), "f"(element.z),
                    "f"(element.w)
                    : "memory");
+#endif
     }
   }
 }
