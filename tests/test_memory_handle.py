@@ -10,6 +10,7 @@ import pytest
 import torch
 from multiprocessing import Process, Pipe
 
+from flexkv.gpu_backend import current_backend as _gpu_backend
 from flexkv.common.memory_handle import TensorSharedHandle
 
 
@@ -84,35 +85,6 @@ def _worker_test_tensor_from_tensor_direct_ipc(conn, device_id):
         raise
 
 
-def _worker_test_fp8_tensor_from_bytes(conn, device_id):
-    """Test construction from bytes with fp8 dtype"""
-    try:
-        handle = conn.recv()
-        assert isinstance(handle, TensorSharedHandle)
-        assert handle.use_direct_ipc
-        assert handle.tensor_dtype == torch.float8_e4m3fn
-        assert handle.tensor_shape == (10, 20)
-
-        tensor = handle.get_tensor()
-        assert isinstance(tensor, torch.Tensor)
-        assert tensor.is_cuda
-        assert tensor.device.index == device_id
-        assert tensor.shape == (10, 20)
-        assert tensor.dtype == torch.float8_e4m3fn
-
-        expected = (
-            torch.arange(200, dtype=torch.float32)
-            .reshape(10, 20)
-            .cuda(device_id)
-            .to(torch.float8_e4m3fn)
-        )
-        max_diff = (tensor.to(torch.float32) - expected.to(torch.float32)).abs().max().item()
-        conn.send(max_diff)
-    except Exception as e:
-        conn.send(f"Error: {e}")
-        raise
-
-
 def _worker_test_tensor_from_bytes(conn, device_id):
     """Test construction from bytes (IPC handle)"""
     try:
@@ -153,7 +125,7 @@ def _worker_test_tensor_from_bytes(conn, device_id):
         raise
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA support required")
+@pytest.mark.skipif(not _gpu_backend.is_available(), reason="GPU support required")
 def test_tensor_from_tensor_pytorch_ipc():
     """Test method 1: Construction from torch.Tensor (default PyTorch IPC)"""
     mp.set_start_method("spawn", force=True)
@@ -193,7 +165,7 @@ def test_tensor_from_tensor_pytorch_ipc():
     parent_conn.close()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA support required")
+@pytest.mark.skipif(not _gpu_backend.is_available(), reason="GPU support required")
 def test_tensor_from_tensor_direct_ipc():
     """Test method 2: Construction from torch.Tensor (forced direct CUDA IPC)"""
     mp.set_start_method("spawn", force=True)
@@ -239,7 +211,7 @@ def test_tensor_from_tensor_direct_ipc():
     parent_conn.close()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA support required")
+@pytest.mark.skipif(not _gpu_backend.is_available(), reason="GPU support required")
 def test_tensor_from_bytes():
     """Test method 3: Construction from bytes (IPC handle)"""
     mp.set_start_method("spawn", force=True)
@@ -295,7 +267,7 @@ def test_tensor_from_bytes():
     parent_conn.close()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA support required")
+@pytest.mark.skipif(not _gpu_backend.is_available(), reason="GPU support required")
 def test_tensor_from_bytes_with_string_dtype():
     """Test construction from bytes with string dtype"""
     device_id = 0
@@ -323,7 +295,7 @@ def test_tensor_from_bytes_with_string_dtype():
     # that construction and property setting are correct.
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA support required")
+@pytest.mark.skipif(not _gpu_backend.is_available(), reason="GPU support required")
 def test_tensor_from_bytes_with_different_device():
     """Test construction from bytes with different device specified"""
     source_device_id = 0
@@ -352,7 +324,7 @@ def test_tensor_from_bytes_with_different_device():
     # that device parameter setting is correct.
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA support required")
+@pytest.mark.skipif(not _gpu_backend.is_available(), reason="GPU support required")
 def test_tensor_from_bytes_missing_required_params():
     """Test construction from bytes with missing required parameters"""
     device_id = 0
@@ -400,23 +372,23 @@ def test_tensor_from_bytes_missing_required_params():
         )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA support required")
+@pytest.mark.skipif(not _gpu_backend.is_available(), reason="GPU support required")
 def test_tensor_from_unsupported_type():
     """Test unsupported data type"""
     with pytest.raises(ValueError, match="Unsupported data type"):
         TensorSharedHandle("not a tensor or bytes")
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA support required")
+@pytest.mark.skipif(not _gpu_backend.is_available(), reason="GPU support required")
 def test_tensor_from_cpu_tensor():
     """Test that CPU tensor should raise error"""
     cpu_tensor = torch.arange(200, dtype=torch.float32).reshape(10, 20)
 
-    with pytest.raises(ValueError, match="Only support CUDA tensor sharing"):
+    with pytest.raises(ValueError, match="Only support GPU tensor sharing"):
         TensorSharedHandle(cpu_tensor)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA support required")
+@pytest.mark.skipif(not _gpu_backend.is_available(), reason="GPU support required")
 def test_tensor_dtype_string_mapping():
     """Test various string dtype formats"""
     device_id = 0
@@ -464,7 +436,47 @@ def _worker_modify_tensor(conn, handle):
     conn.send(True)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA support required")
+def _worker_test_fp8_tensor_from_bytes(conn, device_id):
+    """Worker for test_fp8_tensor_from_bytes_roundtrip.
+
+    Receives a TensorSharedHandle constructed from raw IPC bytes + dtype="fp8",
+    reconstructs the fp8 tensor in this process, and reports the max bytewise
+    diff against the expected pattern back to the parent. fp8 has no torch.allclose,
+    so we compare the raw int8 view (0..199 cast to fp8 then back to int8 bits).
+    """
+    try:
+        handle = conn.recv()
+        assert isinstance(handle, TensorSharedHandle)
+        assert handle.use_direct_ipc, "fp8 IPC handle should use direct GPU IPC"
+        assert handle.tensor_dtype == torch.float8_e4m3fn
+        assert handle.tensor_shape == (10, 20)
+
+        tensor = handle.get_tensor()
+        assert isinstance(tensor, torch.Tensor)
+        assert tensor.is_cuda, "tensor should be on GPU"
+        assert tensor.device.index == device_id
+        assert tensor.shape == (10, 20)
+        assert tensor.dtype == torch.float8_e4m3fn
+
+        # Build the same expected fp8 pattern as the parent did, then compare
+        # the underlying byte representation (fp8 has no allclose / subtract).
+        expected = (
+            torch.arange(200, dtype=torch.float32)
+            .reshape(10, 20)
+            .cuda(device_id)
+            .to(torch.float8_e4m3fn)
+        )
+        diff = (
+            tensor.view(torch.int8).to(torch.int32)
+            - expected.view(torch.int8).to(torch.int32)
+        ).abs().max().item()
+        conn.send(int(diff))
+    except Exception as e:
+        conn.send(f"Error: {e}")
+        raise
+
+
+@pytest.mark.skipif(not _gpu_backend.is_available(), reason="GPU support required")
 def test_tensor_shared_memory_modification():
     """Test if shared memory modifications are visible (using direct CUDA IPC)"""
     mp.set_start_method("spawn", force=True)
@@ -491,7 +503,7 @@ def test_tensor_shared_memory_modification():
 
 
 @pytest.mark.skipif(
-    (not torch.cuda.is_available()) or (not hasattr(torch, "float8_e4m3fn")),
+    (not _gpu_backend.is_available()) or (not hasattr(torch, "float8_e4m3fn")),
     reason="CUDA with fp8 support required",
 )
 def test_fp8_tensor_from_bytes_roundtrip():
