@@ -1,56 +1,41 @@
 from __future__ import annotations
 
-import ctypes
 from dataclasses import dataclass
 from typing import Optional
 
 import torch
 
 from flexkv.common.debug import flexkv_logger
+from flexkv.gpu_backend import current_backend as _gpu_backend
 from flexkv.storage.allocator import alloc_hugepage_tensor, free_hugepage_tensor
-
-_cudart = None
-_cudart_load_error: Optional[OSError] = None
-
-
-def _get_cudart():
-    global _cudart
-    global _cudart_load_error
-
-    if _cudart is None and _cudart_load_error is None:
-        try:
-            _cudart = ctypes.CDLL("libcudart.so")
-        except OSError as e:
-            _cudart_load_error = e
-
-    if _cudart is None:
-        raise RuntimeError(f"libcudart.so is unavailable: {_cudart_load_error}")
-    return _cudart
 
 
 def cuda_host_registration_available() -> bool:
+    """Whether the active GPU backend can pin host tensors.
+
+    On NVIDIA this routes to cudaHostRegister via libcudart, on ROCm to
+    hipHostRegister via libamdhip64. The check piggy-backs on backend
+    initialization so it is cheap.
+    """
     try:
-        _get_cudart()
-    except RuntimeError:
+        return _gpu_backend.is_available()
+    except Exception:
         return False
-    return True
 
 
 def cudaHostRegister(tensor: torch.Tensor) -> None:
-    cudart = _get_cudart()
-    ptr = tensor.data_ptr()
-    size = tensor.numel() * tensor.element_size()
-    ret = cudart.cudaHostRegister(ctypes.c_void_p(ptr), ctypes.c_size_t(size), 1)
-    if ret != 0:
-        raise RuntimeError(f"cudaHostRegister failed with error code {ret}")
+    """Pin a CPU tensor with the active GPU backend.
+
+    Name kept for backward compatibility with existing call-sites; the
+    actual runtime call is dispatched by the GPU backend
+    (cudaHostRegister / hipHostRegister / musaHostRegister).
+    """
+    _gpu_backend.register_host_tensor(tensor)
 
 
 def cudaHostUnregister(tensor: torch.Tensor) -> None:
-    cudart = _get_cudart()
-    ptr = tensor.data_ptr()
-    ret = cudart.cudaHostUnregister(ctypes.c_void_p(ptr))
-    if ret != 0:
-        raise RuntimeError(f"cudaHostUnregister failed with error code {ret}")
+    """Unpin a CPU tensor with the active GPU backend (vendor-dispatched)."""
+    _gpu_backend.unregister_host_tensor(tensor)
 
 
 @dataclass
