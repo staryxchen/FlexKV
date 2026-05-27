@@ -49,7 +49,7 @@ static void transfer_kv_blocks_binding(
     int64_t gpu_layer_stride_in_bytes, torch::Tensor& cpu_block_id_tensor,
     torch::Tensor& cpu_tensor, int64_t cpu_kv_stride_in_bytes,
     int64_t cpu_layer_stride_in_bytes, int64_t cpu_block_stride_in_bytes,
-    int64_t chunk_size_in_bytes, int start_layer_id, int num_layers,
+    int64_t chunk_size_in_bytes, int num_layers,
     int transfer_num_cta = 4, bool is_host_to_device = true,
     bool use_ce_transfer = false, bool is_mla = false, int gpu_block_type = 0,
     bool sync = true) {
@@ -85,7 +85,7 @@ static void transfer_kv_blocks_binding(
   switch (backend_type) {
     case flexkv::BackendType::VLLM:
       flexkv::transfer_kv_blocks<flexkv::BackendType::VLLM>(
-          num_blocks, start_layer_id, num_layers, gpu_block_ids, handler, 0,
+          num_blocks, /*start_layer_id=*/0, num_layers, gpu_block_ids, handler, 0,
           cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
           cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes, 0,
           chunk_size_in_bytes, stream, transfer_num_cta, is_host_to_device,
@@ -93,7 +93,7 @@ static void transfer_kv_blocks_binding(
       break;
     case flexkv::BackendType::TRTLLM:
       flexkv::transfer_kv_blocks<flexkv::BackendType::TRTLLM>(
-          num_blocks, start_layer_id, num_layers, gpu_block_ids, handler, 0,
+          num_blocks, /*start_layer_id=*/0, num_layers, gpu_block_ids, handler, 0,
           cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
           cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes, 0,
           chunk_size_in_bytes, stream, transfer_num_cta, is_host_to_device,
@@ -101,7 +101,7 @@ static void transfer_kv_blocks_binding(
       break;
     case flexkv::BackendType::SGLANG:
       flexkv::transfer_kv_blocks<flexkv::BackendType::SGLANG>(
-          num_blocks, start_layer_id, num_layers, gpu_block_ids, handler, 0,
+          num_blocks, /*start_layer_id=*/0, num_layers, gpu_block_ids, handler, 0,
           cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
           cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes, 0,
           chunk_size_in_bytes, stream, transfer_num_cta, is_host_to_device,
@@ -307,7 +307,7 @@ void register_nvidia_bindings(py::module_& m) {
         py::arg("cpu_tensor"), py::arg("cpu_kv_stride_in_bytes"),
         py::arg("cpu_layer_stride_in_bytes"),
         py::arg("cpu_block_stride_in_bytes"), py::arg("chunk_size_in_bytes"),
-        py::arg("start_layer_id"), py::arg("num_layers"),
+        py::arg("num_layers"),
         py::arg("transfer_num_cta") = 4, py::arg("is_host_to_device") = true,
         py::arg("use_ce_transfer") = false, py::arg("is_mla") = false,
         py::arg("gpu_block_type") = 0, py::arg("sync") = true);
