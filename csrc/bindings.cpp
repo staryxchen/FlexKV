@@ -303,17 +303,14 @@ PYBIND11_MODULE(c_ext, m) {
   // ---- Radix tree (CPU-only) ---------------------------------------------
   py::class_<flexkv::CRadixTreeIndex>(m, "CRadixTreeIndex")
       .def(py::init([](int tokens_per_block, unsigned int max_num_blocks,
-                       int hit_reward_seconds, std::string eviction_policy,
-                       int protected_threshold) {
+                       int hit_reward_seconds, std::string eviction_policy) {
              auto policy = flexkv::parse_eviction_policy(eviction_policy);
              return new flexkv::CRadixTreeIndex(
-                 tokens_per_block, max_num_blocks, hit_reward_seconds, policy,
-                 protected_threshold);
+                 tokens_per_block, max_num_blocks, hit_reward_seconds, policy);
            }),
            py::arg("tokens_per_block"), py::arg("max_num_blocks") = 1000000,
            py::arg("hit_reward_seconds") = 0,
-           py::arg("eviction_policy") = "lru",
-           py::arg("protected_threshold") = 2)
+           py::arg("eviction_policy") = "lru")
       .def("is_empty", &flexkv::CRadixTreeIndex::is_empty)
       .def("reset", &flexkv::CRadixTreeIndex::reset)
       .def("lock", &flexkv::CRadixTreeIndex::lock, py::arg("node"))
@@ -504,15 +501,14 @@ PYBIND11_MODULE(c_ext, m) {
   py::class_<flexkv::LocalRadixTree, flexkv::CRadixTreeIndex>(m,
                                                               "LocalRadixTree")
       .def(py::init<int, unsigned int, uint32_t, uint32_t, uint32_t, uint32_t,
-                    uint32_t, uint32_t, uint32_t, std::string, int>(),
+                    uint32_t, uint32_t, uint32_t, std::string>(),
            py::arg("tokens_per_block"), py::arg("max_num_blocks") = 1000000u,
            py::arg("lease_ttl_ms") = 100000, py::arg("renew_lease_ms") = 0,
            py::arg("refresh_batch_size") = 256, py::arg("idle_sleep_ms") = 10,
            py::arg("safety_ttl_ms") = 100,
            py::arg("swap_block_threshold") = 1024,
            py::arg("hit_reward_seconds") = 0,
-           py::arg("eviction_policy") = "lru",
-           py::arg("protected_threshold") = 2)
+           py::arg("eviction_policy") = "lru")
       .def("set_meta_channel", &flexkv::LocalRadixTree::set_meta_channel,
            py::arg("channel"))
       .def("start", &flexkv::LocalRadixTree::start, py::arg("channel"))
