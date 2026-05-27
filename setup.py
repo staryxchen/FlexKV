@@ -15,8 +15,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
 def get_version() -> str:
-    with open(os.path.join(os.path.dirname(__file__), "VERSION")) as f:
-        return f.read().strip()
+    # The VERSION file lives at repo root on `main`. On branches that
+    # haven't picked it up yet (e.g. `feat/layerwise_rebase` at the time
+    # of writing) we fall back to a development marker so editable
+    # installs still work.
+    version_path = os.path.join(os.path.dirname(__file__), "VERSION")
+    if os.path.exists(version_path):
+        with open(version_path) as f:
+            return f.read().strip()
+    return "0.0.0+dev"
 
 
 def get_install_requires():
