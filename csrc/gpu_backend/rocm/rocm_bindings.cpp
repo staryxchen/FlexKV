@@ -128,13 +128,13 @@ void register_rocm_bindings(py::module_& m) {
         py::arg("gpu_block_type") = 0);
 
   py::class_<flexkv::TPTransferThreadGroup>(m, "TPTransferThreadGroup")
-      .def(py::init<int, const std::vector<int64_t>&, int, int64_t, int, int,
+      .def(py::init<int, const std::vector<int64_t>&, int, int64_t, int,
                     const std::vector<int64_t>&, const std::vector<int64_t>&,
                     const std::vector<int64_t>&, const std::vector<int64_t>&,
                     const std::vector<int64_t>&>(),
            py::arg("num_gpus"), py::arg("gpu_block_ptrs_flat"),
            py::arg("num_tensors_per_gpu"), py::arg("cpu_blocks_ptr"),
-           py::arg("dp_group_id"), py::arg("num_layers"),
+           py::arg("num_layers"),
            py::arg("gpu_kv_strides_in_bytes"),
            py::arg("gpu_block_strides_in_bytes"),
            py::arg("gpu_layer_strides_in_bytes"),
