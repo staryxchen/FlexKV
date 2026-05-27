@@ -27,6 +27,10 @@ GDS (§3.5.1 of `README_en.md`) 在 ROCm 上**天然不需要验证**——`supp
 
 ## 2. 当前进度
 
+本节按"验证轮次"组织。每次代码 base 改变都开一个新 Round——上一轮的结论只对当时的 base 负责,新 base 必须重新走一遍。
+
+### 2.1 Round 1 — 基于 main 的 `star/gpu_backend` 分支(✅ 2026-05-21 全通过)
+
 | Stage | 状态 | 完成日期 | 备注 |
 | ----- | ---- | -------- | ---- |
 | 0. 环境前置 | ✅ 完成 | 2026-05-21 | ROCm 7.2.26015 / HIP 7.2 / torch hip=7.2 / hipify-perl=/opt/rocm/bin/hipify-perl |
@@ -35,6 +39,39 @@ GDS (§3.5.1 of `README_en.md`) 在 ROCm 上**天然不需要验证**——`supp
 | 3. 真机能力 | ✅ 完成 | 2026-05-21 | 15/15 通过;新增 `test_rocm_runtime.py`;过程中调整两次测试设计,见 §7.7 |
 | 4. 端到端 KV 传输 | ✅ 完成 | 2026-05-21 | memory_handle 11/11 + cache_engine 179/183 + kvmanager 60/60 + namespace 6/6;**发现 2 个上游 abstraction 漏洞**(MPS / CE transfer),需 2 个环境变量旁路,见 §7.8 |
 | 5. 真实集成 | ⏳ 待办(可选) | — | — |
+
+### 2.2 Round 2 — 基于 `feat/layerwise_rebase` 的 `star/gpu_backend-on-layerwise` 分支(⏳ 2026-05-26 进行中)
+
+> base 切换到 `origin/feat/layerwise_rebase`(commit `00cc828` `refactor: separate per-rank state into RankInfo and unify dp_client_id (#165)` 上,GPU backend 抽象**重做**了一遍而不是 cherry-pick)。需要重新走一遍 Stage 0-4,因为编译产物、Python 模块路径、binding 注册顺序都重建了。
+
+| Stage | 状态 | 完成日期 | 备注 |
+| ----- | ---- | -------- | ---- |
+| 0. 环境前置 | ⏳ 待执行 | — | 假定与 Round 1 同机器,仍需快速 sanity(`rocm-smi` / `hipcc --version`) |
+| 1. ROCm 构建链路 | ⚠️ 进行中 | — | 关注:`csrc/layerwise.cpp` 应被 `cuda_builder.py` 编译进 NVIDIA wheel,而 `rocm_builder.py` 不应编它(NVTX 依赖);`csrc/eviction_strategy.cpp` 不在 layerwise_rebase 上,已从 `_COMMON_SOURCES` 移除。**已踩坑**:① §7.1 `--no-build-isolation` 漏加 → 加上后 hipify 通过,`Total number of unsupported CUDA function calls: 0`;② Cython < 3.0 不识别 `from __future__ import annotations` → 升 `Cython>=3.0.10`;③ `VERSION` 文件 layerwise_rebase 上不存在 → setup.py 的 `get_version()` 加 fallback `"0.0.0+dev"`;④ `liburing-dev` 系统包没装(§7.4) → `apt install`;⑤ 老位置 4 个 header 必须改成 shim(`csrc/{transfer,gtensor_handler,tp_transfer_thread_group}.{cuh,h}` + `csrc/gds/tp_gds_transfer_thread_group.h`),否则 `rocm_bindings.cpp` 链上同时拉到老/新两份 header,出 `multiple definition of BackendType` + 默认参数 redeclaration 错误;⑥ `csrc/gpu_backend/rocm/rocm_bindings.cpp` 漏改了 `dp_group_id` 撤回(原 11 args binding,新 ctor 10 args) |
+| 2. Dispatch 分发 | ⏳ 待执行 | — | 测试文件本身没变,只看 import + 抽象分发是否还工作 |
+| 3. 真机能力 | ⏳ 待执行 | — | 测试文件本身没变 |
+| 4. 端到端 KV 传输 | ⏳ 待执行 | — | 重点回归:`bool sync` 参数 + `FLEXKV_GPU_CPU_TRANSFER` metrics 是 layerwise_rebase 引入、本轮 forward-port 到新位置的功能,必须确认还工作;`LayerwiseTransferGroup` binding 在 NVIDIA 下应可见、在 ROCm 下不可见(`hasattr(c_ext, 'LayerwiseTransferGroup')`) |
+| 5. 真实集成 | ⏳ 待办(可选) | — | vLLM 路径完整;**SGLang adapter 不在本分支**(`flexkv/integration/sglang/` 缺失,见 §6.4.3 路径选择);TRT-LLM 不支持 ROCm |
+
+**Round 2 相对 Round 1 的变化点速览**(失败时按这个清单定位):
+
+| 改动层 | 变化 | 失败时怀疑这里 |
+| ----- | ---- | -------------- |
+| C++ kernel | `csrc/gpu_backend/nvidia/transfer.{cu,cuh}` 新增 `bool sync = true` 参数 + `FLEXKV_GPU_CPU_TRANSFER` metrics 调用(forward-port 自 layerwise_rebase 老位置) | 编译错误若提示模板实例化签名不匹配 / 调用方少传一个 bool |
+| C++ binding | `csrc/gpu_backend/nvidia/{tp_transfer_thread_group.{h,cpp},gds/tp_gds_transfer_thread_group.h,nvidia_bindings.cpp}` **撤回** `dp_group_id` 形参(layerwise_rebase 还没合并 main #166) | Python `TPTransferThreadGroup(...)` 调用如果传了 `dp_group_id` 会失败 |
+| C++ binding | `csrc/bindings.cpp` 中 `LayerwiseTransferGroup` binding 用 `#ifdef FLEXKV_BACKEND_NVIDIA` 包住(`csrc/layerwise.cpp` 用 NVTX) | ROCm wheel 上 `hasattr(c_ext, 'LayerwiseTransferGroup')` 应为 `False`;NVIDIA wheel 上应为 `True` |
+| Python | `flexkv/transfer/host_buffer.py` 的 `cudaHostRegister/Unregister` 不再 `ctypes.CDLL("libcudart.so")`,改走 `_gpu_backend.{register,unregister}_host_tensor()` | ROCm 上 register host tensor 失败 / NVIDIA 上行为变化 |
+| Build | `cuda_builder.py` 添加 `csrc/layerwise.cpp` source、移除 `csrc/eviction_strategy.cpp`(layerwise_rebase 上不存在);`rocm_builder.py` **不**编译 `layerwise.cpp` | wheel build 阶段缺源 / 多源报错 |
+| 旧位置文件 | `csrc/{transfer.{cu,cuh},tp_transfer_thread_group.{h,cpp},gtensor_handler.cuh,gds/*}` **不动**(保留 layerwise_rebase 完整内容);`cuda_builder._pick` 优先选新位置 `csrc/gpu_backend/nvidia/...`,旧位置不会被编译 | 若不小心两边都进 build,会 multiple definition |
+
+**未在本轮 rebase 中携带**(避免引入 layerwise_rebase 还未合并的 main 改动):
+
+- `dp_group_id`(main #166)
+- `RankInfo` / `dp_client_id` 重构(main #165 — 注:layerwise_rebase 顶端 `00cc828` 也叫 #165,但 csrc 层未包含 dp_group_id)
+- `NixlTransferWorker`
+- multi-node TP 辅助(`is_multinode_tp`、`tp_node_count`、`get_visible_device_map`、`strip_visible_devices`、`_need_to_create_remote_process`)
+
+> 这些是 main 上独立 PR,等 layerwise_rebase 自己追上 main 时再合并即可。本轮不夹带是为了让"GPU backend 抽象"这一次改动**只做一件事**。
 
 ---
 
@@ -95,6 +132,14 @@ FlexKV 是 **两阶段构建**,这一点对新手不够友好(install.sh 把它�
 `build_backends/rocm_builder.py` 的 `get_include_dirs()` 第一项就是 `build/include`,**假定**第一阶段已完成。直接跳到 1B 会报 `xxhash.h: No such file or directory`。
 
 ### 5.2 完整构建命令(已验证可工作)
+
+> **TL;DR — 三个不能省的 flag + 一组前置 deps**:
+> - `FLEXKV_GPU_BACKEND=rocm`(否则会自动选 NVIDIA / Generic builder)
+> - `--no-build-isolation`(否则 pip 会从 PyPI 拉 **NVIDIA 版 torch** 进 `/tmp/pip-build-env-*/` 屏蔽你 venv 里的 ROCm torch — 失败现象:`OSError: CUDA_HOME environment variable is not set`,根因见 §7.1)
+> - `Cython>=3.0.10`(`--no-build-isolation` 后 pip 不会自动给你装,而 layerwise_rebase 的源码用了 `from __future__ import annotations`,Cython < 3.0 会报 `future feature annotations is not defined` — 必须升级)
+> - 先做完 Stage 1A(vendored xxhash 编译,见下面的 cmake 三行),否则 `xxhash.h: No such file` — 根因见 §7.3
+>
+> 漏一个就翻车,**漏哪个去文档里搜对应章节**。
 
 ```bash
 cd /path/to/FlexKV
@@ -258,13 +303,30 @@ pytest tests/test_namespace_isolation.py -v
 
 ### 6.4 Stage 5 · 真实集成 (可选)
 
-```bash
-# 微基准
-python benchmarks/benchmark_single_batch.py --config benchmarks/example_config.yml
+#### 6.4.1 在当前分支上能直接做的
 
-# 与 vLLM ROCm 集成(需要 ROCm 版 vLLM)
-# 见 examples/vllm_adaption/
+```bash
+# 微基准 — 不依赖任何 LLM 框架,只测 FlexKV 自身的 KV transfer 吞吐
+python benchmarks/benchmark_single_batch.py --config benchmarks/example_config.yml
 ```
+
+#### 6.4.2 与推理框架联调 — 路径取决于框架
+
+| 框架 | layerwise_rebase 上的状态 | 端到端路径 |
+| --- | --- | --- |
+| **vLLM** | ✅ 完整 — `flexkv/integration/vllm/vllm_v1_adapter.py` + `examples/vllm_adaption/` (含 0.10.1.1 / 0.14.1+ / 0.16.0 patch) | 装 ROCm 版 vLLM,见 `examples/vllm_adaption/launch.sh` |
+| **TRT-LLM** | ✅ 完整 — `flexkv/integration/tensorrt_llm/trtllm_adapter.py` + `examples/trtllm_adaption/` (含 v1.1.0rc2 / rc5 patch) | TRT-LLM 不支持 ROCm,本路径 ROCm 验证不适用 |
+| **SGLang** | ⚠️ **半成品** — C++ 层有 `BackendType::SGLANG` KV layout、`flexkv/integration/config.py` 有 `post_init_from_sglang_config()`、`flexkv/transfer/layerwise.py` 有 SGLang eventfds 路径,但 **没有 `flexkv/integration/sglang/` server-side adapter,也没有 `examples/sglang_adaption/`** | 见 §6.4.3 |
+
+#### 6.4.3 SGLang 联调说明(layerwise_rebase 暂不自带)
+
+`origin/feat/layerwise_rebase` 把 SGLang 当作**数据布局一等公民**支持(C++ KV layout、Python config、layerwise transfer 的 eventfds Unix socket 通道),但**不包含** SGLang server-side adapter。要走端到端 SGLang 路径,需要其中之一:
+
+- **(机器自带)** 验证机上已经独立装了某个版本的 SGLang + FlexKV adapter setup — 直接用现有的启动方式,本文档的 Stage 4 走完即可,Stage 5 用机器上的脚本跑。
+- **(自行合并)** 把 fork 上的 `feat/sglang-distributed-mode` 分支(目前唯一有完整 `flexkv/integration/sglang/{hicache_storage_adapter.py,patch_sglang.py,patches/sglang_flexkv.patch,...}` 的分支)合并进来。这是另一次 rebase 工作,本轮**未做**。
+- **(等上游)** 等 `flexkv/integration/sglang/` 合并进 `origin/feat/layerwise_rebase` 或 `origin/main`,届时再走。
+
+> 也就是说:**本轮 Stage 5 SGLang 路径不是"能不能跑"的问题,是"代码不在这个分支上"的问题**。要做 Stage 5 SGLang 验证,先把上面三条之一选定。
 
 ---
 
