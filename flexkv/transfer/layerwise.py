@@ -8,7 +8,17 @@ from typing import List, Any, Dict, Union, Optional, Tuple
 
 import torch
 
-from flexkv.c_ext import LayerwiseTransferGroup
+# LayerwiseTransferGroup is NVIDIA-only because csrc/layerwise.cpp uses NVTX.
+# On ROCm the C++ binding is gated by ``#ifdef FLEXKV_BACKEND_NVIDIA``, so the
+# symbol is absent from ``flexkv.c_ext``.  Importing this module must still
+# succeed (transfer_engine / kvtask import unconditionally), so we fall back
+# to ``None`` and let LayerwiseTransferWorker.__init__ raise a clear
+# RuntimeError if a user actually enables FLEXKV_ENABLE_LAYERWISE_TRANSFER on
+# ROCm.
+try:
+    from flexkv.c_ext import LayerwiseTransferGroup
+except ImportError:
+    LayerwiseTransferGroup = None
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
@@ -88,6 +98,13 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                  indexer_ssd_files: Optional[Dict[int, List[str]]] = None,
                  indexer_ssd_kv_layout: Optional[KVCacheLayout] = None,
                  indexer_num_blocks_per_file: int = 0) -> None:
+        if LayerwiseTransferGroup is None:
+            raise RuntimeError(
+                "Layerwise transfer requires the NVIDIA backend; "
+                "LayerwiseTransferGroup uses NVTX which has no ROCm "
+                "equivalent.  Set FLEXKV_ENABLE_LAYERWISE_TRANSFER=0 "
+                "(default) on ROCm."
+            )
         flexkv_logger.debug(
             f"[LayerwiseWorker] __init__ started: worker_id={worker_id}, "
             f"tp_group_size={tp_group_size}, "

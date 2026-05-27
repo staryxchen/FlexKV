@@ -40,6 +40,17 @@ def _fp8_cuda_ops_unavailable():
     except NotImplementedError:
         return True
 
+
+def _layerwise_transfer_unavailable():
+    """True if LayerwiseTransferGroup is not bound to flexkv.c_ext.
+
+    LayerwiseTransferGroup is NVIDIA-only because ``csrc/layerwise.cpp`` uses
+    NVTX which has no ROCm equivalent.  On ROCm the binding is hidden by
+    ``#ifdef FLEXKV_BACKEND_NVIDIA``, so the attribute is missing.
+    """
+    from flexkv import c_ext
+    return not hasattr(c_ext, 'LayerwiseTransferGroup')
+
 def run_tp_client(dp_client_id,
                   tp_rank,
                   server_recv_port,
@@ -1043,6 +1054,10 @@ def _mock_sglang_eventfd_client(socket_path: str,
     # process exits and the OS reclaims the file descriptors.
 
 
+@pytest.mark.skipif(
+    _layerwise_transfer_unavailable(),
+    reason="LayerwiseTransferGroup is NVIDIA-only (NVTX dependency, not on ROCm)",
+)
 @pytest.mark.parametrize(
     "model_config",
     [
