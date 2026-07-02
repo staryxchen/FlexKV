@@ -4,7 +4,7 @@
 #include <fcntl.h>
 #include <map>
 #include <memory>
-#include <nvtx3/nvToolsExt.h>
+#include "nvtx_compat.h"
 #include <string>
 #include <sys/eventfd.h>
 #include <torch/extension.h>

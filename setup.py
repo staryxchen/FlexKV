@@ -7,10 +7,17 @@ from setuptools import find_packages, setup
 from setuptools.command.build_ext import build_ext
 from torch.utils import cpp_extension
 
+try:
+    import torch
+    # torch.version.hip is set (non-None) only on ROCm builds of PyTorch.
+    IS_ROCM = torch.version.hip is not None
+except Exception:
+    IS_ROCM = False
+
 
 def detect_cuda_arch():
-    """Auto-detect GPU compute capability. Returns a semicolon-separated arch list.
-    Falls back to a safe default when no GPU is available."""
+    """Auto-detect NVIDIA GPU compute capability. Returns a semicolon-separated
+    arch list. Falls back to a safe default when no GPU is available."""
     try:
         import torch
         if torch.cuda.is_available():
@@ -27,6 +34,30 @@ def detect_cuda_arch():
     # Fallback: common architectures (Ampere + Hopper)
     fallback = "8.0;8.6;9.0"
     print(f"No GPU detected, using fallback architectures: {fallback}")
+    return fallback
+
+
+def detect_rocm_arch():
+    """Auto-detect AMD GPU gfx target(s). Returns a semicolon-separated arch
+    list (e.g. 'gfx942'). Falls back to a safe default when no GPU is
+    available."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            archs = set()
+            for i in range(torch.cuda.device_count()):
+                # e.g. "gfx942:sramecc+:xnack-" -> "gfx942"
+                gcn_arch = torch.cuda.get_device_properties(i).gcnArchName
+                archs.add(gcn_arch.split(":")[0])
+            if archs:
+                arch_list = ";".join(sorted(archs))
+                print(f"Auto-detected AMD GPU architectures: {arch_list}")
+                return arch_list
+    except Exception as e:
+        print(f"AMD GPU architecture auto-detection failed: {e}")
+    # Fallback: MI200/MI300 series
+    fallback = "gfx90a;gfx942"
+    print(f"No AMD GPU detected, using fallback architectures: {fallback}")
     return fallback
 
 def get_version():
@@ -88,14 +119,25 @@ hpp_sources = [
 ]
 
 # extra_link_args: dist/Redis (libhiredis) only when FLEXKV_ENABLE_P2P=1
-extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring"]
+# Note: "-lcuda" (the CUDA driver API stub) has no ROCm/HIP equivalent needed
+# here, since all GPU calls go through the HIP/CUDA *runtime* API (linked via
+# the CUDAExtension itself), so it is only added on native CUDA builds.
+extra_link_args = ["-lxxhash", "-lpthread", "-lrt", "-luring"]
+if not IS_ROCM:
+    extra_link_args.append("-lcuda")
+else:
+    # roctx (NVTX->ROCTX shim target, see csrc/nvtx_compat.h) ships real
+    # exported symbols (unlike CUDA's header-only nvtx3), so it needs linking.
+    extra_link_args.append("-lroctx64")
 if enable_p2p:
     extra_link_args.append("-lhiredis")
 
 if enable_cputest:
-    extra_link_args.remove("-lcuda")
+    if "-lcuda" in extra_link_args:
+        extra_link_args.remove("-lcuda")
     # Set TORCH_CUDA_ARCH_LIST to avoid IndexError when no GPU is available
-    os.environ["TORCH_CUDA_ARCH_LIST"] = "7.0;7.5;8.0;8.6;9.0"
+    if not IS_ROCM:
+        os.environ["TORCH_CUDA_ARCH_LIST"] = "7.0;7.5;8.0;8.6;9.0"
 
 
 # Prometheus libraries only when metrics enabled
@@ -103,10 +145,19 @@ if enable_metrics:
     extra_link_args.extend(["-lprometheus-cpp-pull", "-lprometheus-cpp-core"])
 else:
     print("FLEXKV_ENABLE_METRICS=0: building without Prometheus monitoring")
-# Auto-detect GPU architecture if TORCH_CUDA_ARCH_LIST is not explicitly set
-if not os.environ.get("TORCH_CUDA_ARCH_LIST"):
-    os.environ["TORCH_CUDA_ARCH_LIST"] = detect_cuda_arch()
-print(f"TORCH_CUDA_ARCH_LIST = {os.environ['TORCH_CUDA_ARCH_LIST']}")
+
+# Auto-detect GPU architecture. ROCm builds use PYTORCH_ROCM_ARCH (gfx targets)
+# while CUDA builds use TORCH_CUDA_ARCH_LIST (compute capabilities); torch's
+# CUDAExtension picks the right one automatically based on torch.version.hip.
+if IS_ROCM:
+    print("Detected ROCm/HIP PyTorch build")
+    if not os.environ.get("PYTORCH_ROCM_ARCH"):
+        os.environ["PYTORCH_ROCM_ARCH"] = detect_rocm_arch()
+    print(f"PYTORCH_ROCM_ARCH = {os.environ['PYTORCH_ROCM_ARCH']}")
+else:
+    if not os.environ.get("TORCH_CUDA_ARCH_LIST"):
+        os.environ["TORCH_CUDA_ARCH_LIST"] = detect_cuda_arch()
+    print(f"TORCH_CUDA_ARCH_LIST = {os.environ['TORCH_CUDA_ARCH_LIST']}")
 
 extra_compile_args = ["-std=c++17", "-O3"]
 if enable_metrics:
@@ -143,7 +194,12 @@ if enable_gds:
         "csrc/gds/tp_gds_transfer_thread_group.h",
         "csrc/gds/layout_transform.cuh",
     ])
-    extra_link_args.append("-lcufile")
+    if IS_ROCM:
+        print("WARNING: FLEXKV_ENABLE_GDS=1 requested on ROCm, but GDS/cuFile "
+              "has no ROCm equivalent; skipping -lcufile link (this build "
+              "will likely fail to link GDS code paths).")
+    else:
+        extra_link_args.append("-lcufile")
     extra_compile_args.append("-DFLEXKV_ENABLE_GDS")
     nvcc_compile_args.append("-DFLEXKV_ENABLE_GDS")
 if enable_p2p:

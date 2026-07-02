@@ -2,10 +2,18 @@
 #include <atomic>
 #include <cstdio>
 #include <fcntl.h>
-#include <nvtx3/nvToolsExt.h>
+#include "nvtx_compat.h"
 #include <stdexcept>
 #include <sys/eventfd.h>
 #include <unistd.h>
+
+// CUDART_CB (a Windows __stdcall calling-convention marker, empty on Linux)
+// is defined by cuda_runtime_api.h but has no HIP counterpart; it is only
+// ever empty on the Linux targets FlexKV builds for, so define it as such
+// when missing (i.e. on ROCm/HIP).
+#ifndef CUDART_CB
+#define CUDART_CB
+#endif
 
 namespace flexkv {
 

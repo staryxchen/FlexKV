@@ -33,6 +33,7 @@ ENABLE_CFS=0
 SKIP_DEPS=0
 CLEAN_ONLY=0
 MOONCAKE_VERSION=""
+P2P_EXPLICIT=0
 
 # Use sudo only if not running as root
 if [ "$(id -u)" -eq 0 ]; then
@@ -85,10 +86,12 @@ while [[ $# -gt 0 ]]; do
             ;;
         --enable-p2p)
             ENABLE_P2P=1
+            P2P_EXPLICIT=1
             shift
             ;;
         --disable-p2p)
             ENABLE_P2P=0
+            P2P_EXPLICIT=1
             shift
             ;;
         --mooncake-version)
@@ -125,6 +128,21 @@ done
 PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJECT_ROOT"
 info "Project root: $PROJECT_ROOT"
+
+# ======================== GPU Toolchain Detection (CUDA vs ROCm) ========================
+IS_ROCM=0
+if command -v hipcc &>/dev/null || command -v rocminfo &>/dev/null; then
+    IS_ROCM=1
+    info "ROCm/HIP toolchain detected (hipcc/rocminfo found)"
+fi
+
+# P2P (Mooncake) is currently only buildable with -DUSE_CUDA=ON (Step 4.6),
+# so on ROCm auto-disable it unless the user explicitly requested it.
+if [ "$IS_ROCM" -eq 1 ] && [ "$P2P_EXPLICIT" -eq 0 ] && [ "$ENABLE_P2P" -eq 1 ]; then
+    warn "ROCm detected: P2P/Mooncake support is not yet ported to ROCm (Mooncake build is CUDA-only)."
+    warn "Auto-disabling P2P (use --enable-p2p to force, at your own risk)."
+    ENABLE_P2P=0
+fi
 
 # ======================== Clean Mode ========================
 if [ "$CLEAN_ONLY" -eq 1 ]; then
@@ -224,11 +242,15 @@ for cmd in python3 cmake git gcc g++; do
     command -v "$cmd" &>/dev/null || error "$cmd is still not available. Please install it manually."
 done
 
-# Check NVIDIA CUDA toolkit
-if ! command -v nvcc &>/dev/null; then
-    warn "nvcc not found. CUDA toolkit is required for building FlexKV."
-    warn "Please install CUDA toolkit from: https://developer.nvidia.com/cuda-downloads"
-    warn "Or load it via: module load cuda"
+# Check GPU toolkit: ROCm (hipcc) or CUDA (nvcc)
+if [ "$IS_ROCM" -eq 1 ]; then
+    success "ROCm toolchain found: $(command -v hipcc || command -v rocminfo)"
+elif command -v nvcc &>/dev/null; then
+    success "CUDA toolkit found: $(command -v nvcc)"
+else
+    warn "Neither nvcc (CUDA) nor hipcc (ROCm) found."
+    warn "Please install the CUDA toolkit (https://developer.nvidia.com/cuda-downloads)"
+    warn "or ROCm (https://rocm.docs.amd.com), or load it via: module load cuda/rocm"
 fi
 
 success "System dependencies check passed."
@@ -349,6 +371,10 @@ if [ "$ENABLE_P2P" -eq 1 ]; then
     info "============================================"
     info "Step 4.6: Building mooncake-transfer-engine from source"
     info "============================================"
+    if [ "$IS_ROCM" -eq 1 ]; then
+        warn "Building Mooncake with -DUSE_CUDA=ON on a ROCm host (forced via --enable-p2p);"
+        warn "Mooncake's transfer-engine has not been validated on ROCm and this step may fail."
+    fi
     if [ -n "$MOONCAKE_VERSION" ]; then
         info "Target version: $MOONCAKE_VERSION"
     else
@@ -526,6 +552,7 @@ success "FlexKV installation completed!"
 info "============================================"
 echo ""
 info "Build type:       $BUILD_TYPE"
+info "GPU platform:     $([ $IS_ROCM -eq 1 ] && echo 'ROCm/HIP' || echo 'CUDA')"
 info "Metrics:          $([ $ENABLE_METRICS -eq 1 ] && echo 'Enabled' || echo 'Disabled')"
 info "P2P/Redis:        $([ $ENABLE_P2P -eq 1 ] && echo 'Enabled' || echo 'Disabled')"
 if [ "$ENABLE_P2P" -eq 1 ]; then

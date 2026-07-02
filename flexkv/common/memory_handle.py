@@ -10,26 +10,23 @@ import torch.multiprocessing.reductions as reductions
 import zmq
 
 from flexkv.common.debug import flexkv_logger
+from flexkv.common.gpu_runtime import (
+    IPC_HANDLE_SIZE as CUDA_IPC_HANDLE_SIZE,
+    IPC_MEM_LAZY_ENABLE_PEER_ACCESS,
+    SUCCESS as cudaSuccess,
+    get_runtime_func,
+    load_gpu_runtime,
+)
 
 
 class cudaIpcMemHandle_t(ctypes.Structure):
     _fields_ = [("reserved", ctypes.c_byte * 64)]
 
 
-# Load CUDA runtime library
-try:
-    cudart = ctypes.CDLL("libcudart.so")
-except:
-    try:
-        cudart = ctypes.CDLL("libcudart.so.12")
-    except:
-        cudart = ctypes.CDLL("libcudart.so.11")
-
-# CUDA IPC handle size (64 bytes on Linux)
-CUDA_IPC_HANDLE_SIZE = 64
+# Load the active GPU runtime (CUDA or ROCm/HIP; see flexkv.common.gpu_runtime).
+cudart = load_gpu_runtime()
 
 # CUDA error codes
-cudaSuccess = 0
 cudaErrorInvalidValue = 11
 
 
@@ -353,8 +350,8 @@ class TensorSharedHandle:
         # ipc_handle = ctypes.create_string_buffer(CUDA_IPC_HANDLE_SIZE)
         ipc_handle = cudaIpcMemHandle_t()
 
-        # Call cudaIpcGetMemHandle
-        result = cudart.cudaIpcGetMemHandle(
+        # Call cudaIpcGetMemHandle (hipIpcGetMemHandle on ROCm)
+        result = get_runtime_func(cudart, "IpcGetMemHandle")(
             ctypes.byref(ipc_handle), ctypes.c_void_p(data_ptr)
         )
 
@@ -409,12 +406,12 @@ class TensorSharedHandle:
         handle = cudaIpcMemHandle_t()
         ctypes.memmove(ctypes.byref(handle), ipc_handle, 64)
 
-        # Open IPC memory handle to get base pointer
+        # Open IPC memory handle to get base pointer (hipIpcOpenMemHandle on ROCm)
         base_ptr = ctypes.c_void_p()
-        result = cudart.cudaIpcOpenMemHandle(
+        result = get_runtime_func(cudart, "IpcOpenMemHandle")(
             ctypes.byref(base_ptr),
             handle,
-            ctypes.c_int(1),  # cudaIpcMemLazyEnablePeerAccess = 1
+            ctypes.c_int(IPC_MEM_LAZY_ENABLE_PEER_ACCESS),
         )
         # Print GPU memory address for comparison with C++ side
 

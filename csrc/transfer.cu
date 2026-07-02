@@ -75,6 +75,15 @@ __global__ void transfer_kv_blocks_kernel_8b(
 
     // Use explicit PTX ld/st (same as float4 path) so D2H can write pinned host
     // memory from device; plain C++ stores may fault on unmapped host pointers.
+    // ROCm/HIP has no equivalent inline PTX; __ldg (read-only cached load) +
+    // a plain global store give the same semantics and correctly reach
+    // mapped pinned host memory from the device.
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM)
+    for (int64_t idx = lane_id; idx < copy_size; idx += 32) {
+      int64_t element = __ldg(&src_chunk_ptr[idx]);
+      dst_chunk_ptr[idx] = element;
+    }
+#else
     for (int64_t idx = lane_id; idx < copy_size; idx += 32) {
       int64_t element;
       asm volatile("ld.global.nc.u64 %0, [%1];"
@@ -85,6 +94,7 @@ __global__ void transfer_kv_blocks_kernel_8b(
                    :: "l"(&dst_chunk_ptr[idx]), "l"(element)
                    : "memory");
     }
+#endif
   }
 }
 
@@ -126,6 +136,12 @@ __global__ void transfer_kv_blocks_kernel(
     int64_t *src_chunk_ptr = is_host_to_device ? cpu_chunk_ptr : gpu_chunk_ptr;
     int64_t *dst_chunk_ptr = is_host_to_device ? gpu_chunk_ptr : cpu_chunk_ptr;
 
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM)
+    for (int64_t idx = lane_id; idx < copy_size_in_float4; idx += 32) {
+      float4 element = __ldg(&FLOAT4_PTR(src_chunk_ptr)[idx]);
+      FLOAT4_PTR(dst_chunk_ptr)[idx] = element;
+    }
+#else
     for (int64_t idx = lane_id; idx < copy_size_in_float4; idx += 32) {
       float4 element;
       asm volatile("ld.global.nc.v4.f32 {%0,%1,%2,%3},[%4];"
@@ -139,6 +155,7 @@ __global__ void transfer_kv_blocks_kernel(
                    "f"(element.w)
                    : "memory");
     }
+#endif
   }
 }
 

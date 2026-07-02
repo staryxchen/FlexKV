@@ -629,8 +629,17 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
 
     enable_layerwise_transfer=bool(int(os.getenv('FLEXKV_ENABLE_LAYERWISE_TRANSFER', 0))),
 
-    use_ce_transfer_h2d=bool(int(os.getenv('FLEXKV_USE_CE_TRANSFER_H2D', 0))),
-    use_ce_transfer_d2h=bool(int(os.getenv('FLEXKV_USE_CE_TRANSFER_D2H', 0))),
+    # Custom D2H/H2D copy kernels dereference the CPU-side pointer directly
+    # from the GPU, relying on CUDA's UVA host/device pointer aliasing for
+    # cudaHostRegister(Mapped) memory. Most ROCm GPUs/driver configs (e.g.
+    # MI300 without XNACK) do not alias host/device pointers this way, so
+    # default to the Copy-Engine (hipMemcpyAsync-based) path on ROCm, which
+    # is unaffected by this and always correct. CUDA's default is unchanged;
+    # either platform can still override via the env vars below.
+    use_ce_transfer_h2d=bool(int(os.getenv(
+        'FLEXKV_USE_CE_TRANSFER_H2D', 1 if torch.version.hip is not None else 0))),
+    use_ce_transfer_d2h=bool(int(os.getenv(
+        'FLEXKV_USE_CE_TRANSFER_D2H', 1 if torch.version.hip is not None else 0))),
     transfer_num_cta_h2d=int(os.getenv('FLEXKV_TRANSFER_NUM_CTA_H2D', 4)),
     transfer_num_cta_d2h=int(os.getenv('FLEXKV_TRANSFER_NUM_CTA_D2H', 4)),
 

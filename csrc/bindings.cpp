@@ -8,7 +8,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <fcntl.h>
-#include <nvtx3/nvToolsExt.h>
+#include "nvtx_compat.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <sys/mman.h>
@@ -17,8 +17,10 @@
 #include <unistd.h>
 
 #include "cache_utils.h"
+#ifdef FLEXKV_ENABLE_GDS
 #include "gds/gds_manager.h"
 #include "gds/tp_gds_transfer_thread_group.h"
+#endif
 #include "pcfs/pcfs.h"
 #include "radix_tree.h"
 #include "tp_transfer_thread_group.h"

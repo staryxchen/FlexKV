@@ -9,6 +9,13 @@ import numpy as np
 import torch
 
 from flexkv.common.debug import flexkv_logger
+from flexkv.common.gpu_runtime import (
+    HOST_REGISTER_MAPPED as CUDA_HOST_REGISTER_MAPPED,
+    HOST_REGISTER_PORTABLE as CUDA_HOST_REGISTER_PORTABLE,
+    SUCCESS as _GPU_RUNTIME_SUCCESS,
+    get_runtime_func,
+    load_gpu_runtime,
+)
 from flexkv.storage.allocator import (
     DEFAULT_HUGE_PAGE_SIZE,
     alloc_hugepage_tensor,
@@ -25,12 +32,12 @@ def _get_cudart():
 
     if _cudart is None and _cudart_load_error is None:
         try:
-            _cudart = ctypes.CDLL("libcudart.so")
-        except OSError as e:
+            _cudart = load_gpu_runtime()
+        except RuntimeError as e:
             _cudart_load_error = e
 
     if _cudart is None:
-        raise RuntimeError(f"libcudart.so is unavailable: {_cudart_load_error}")
+        raise RuntimeError(f"GPU runtime is unavailable: {_cudart_load_error}")
     return _cudart
 
 
@@ -43,10 +50,8 @@ def cuda_host_registration_available() -> bool:
 
 
 # Portable + Mapped: required for custom D2H kernels that store into host pointers.
-CUDA_HOST_REGISTER_PORTABLE = 0x01
-CUDA_HOST_REGISTER_MAPPED = 0x02
-CUDA_HOST_ALLOC_PORTABLE = 0x01
-CUDA_HOST_ALLOC_MAPPED = 0x02
+CUDA_HOST_ALLOC_PORTABLE = CUDA_HOST_REGISTER_PORTABLE
+CUDA_HOST_ALLOC_MAPPED = CUDA_HOST_REGISTER_MAPPED
 
 
 def cudaHostRegister(tensor: torch.Tensor) -> None:
@@ -54,10 +59,10 @@ def cudaHostRegister(tensor: torch.Tensor) -> None:
     ptr = tensor.data_ptr()
     size = tensor.numel() * tensor.element_size()
     flags = CUDA_HOST_REGISTER_PORTABLE | CUDA_HOST_REGISTER_MAPPED
-    ret = cudart.cudaHostRegister(
+    ret = get_runtime_func(cudart, "HostRegister")(
         ctypes.c_void_p(ptr), ctypes.c_size_t(size), ctypes.c_uint(flags)
     )
-    if ret != 0:
+    if ret != _GPU_RUNTIME_SUCCESS:
         raise RuntimeError(f"cudaHostRegister failed with error code {ret}")
     flexkv_logger.info(
         "[FlexKV-D2H-DEBUG] cudaHostRegister ok ptr=0x%x nbytes=%s flags=0x%x",
@@ -70,8 +75,8 @@ def cudaHostRegister(tensor: torch.Tensor) -> None:
 def cudaHostUnregister(tensor: torch.Tensor) -> None:
     cudart = _get_cudart()
     ptr = tensor.data_ptr()
-    ret = cudart.cudaHostUnregister(ctypes.c_void_p(ptr))
-    if ret != 0:
+    ret = get_runtime_func(cudart, "HostUnregister")(ctypes.c_void_p(ptr))
+    if ret != _GPU_RUNTIME_SUCCESS:
         raise RuntimeError(f"cudaHostUnregister failed with error code {ret}")
 
 
@@ -117,12 +122,12 @@ def alloc_mapped_host_tensor(num_elements: int, dtype: torch.dtype) -> torch.Ten
     num_bytes = num_elements * dtype.itemsize
     host_ptr = ctypes.c_void_p()
     flags = CUDA_HOST_ALLOC_PORTABLE | CUDA_HOST_ALLOC_MAPPED
-    err = cudart.cudaHostAlloc(
+    err = get_runtime_func(cudart, "HostAlloc")(
         ctypes.byref(host_ptr),
         ctypes.c_size_t(num_bytes),
         ctypes.c_uint(flags),
     )
-    if err != 0:
+    if err != _GPU_RUNTIME_SUCCESS:
         raise RuntimeError(f"cudaHostAlloc(mapped) failed with error code {err}")
 
     buf_type = ctypes.c_uint8 * num_bytes
@@ -132,7 +137,9 @@ def alloc_mapped_host_tensor(num_elements: int, dtype: torch.dtype) -> torch.Ten
         torch.frombuffer(np_arr, dtype=torch.uint8, count=num_bytes)
         .view(dtype)[:num_elements]
     )
-    weakref.finalize(tensor, lambda p=host_ptr: cudart.cudaFreeHost(p))
+    weakref.finalize(
+        tensor, lambda p=host_ptr: get_runtime_func(cudart, "FreeHost")(p)
+    )
     return tensor
 
 

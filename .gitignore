@@ -76,3 +76,10 @@ cover/
 
 # logs
 *.log
+
+# ROCm/HIP hipify build artifacts (auto-generated in-place next to sources
+# by torch.utils.hipify when building on ROCm; regenerated on every build)
+csrc/**/*_hip.h
+csrc/**/*_hip.cpp
+csrc/**/*_hip.cuh
+csrc/**/*.hip
