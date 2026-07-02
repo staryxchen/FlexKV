@@ -653,7 +653,10 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     hit_reward_seconds=int(os.getenv('FLEXKV_HIT_REWARD_SECONDS', 0)),
     eviction_policy=os.getenv('FLEXKV_EVICTION_POLICY', 'lru'),
 
-    enable_mps=bool(int(os.getenv('FLEXKV_ENABLE_MPS', 1))),
+    # CUDA MPS (nvidia-cuda-mps-control) has no ROCm equivalent; default off
+    # on ROCm builds. Can still be forced on via the env var if desired.
+    enable_mps=bool(int(os.getenv(
+        'FLEXKV_ENABLE_MPS', 0 if torch.version.hip is not None else 1))),
 
     enable_trace=bool(int(os.getenv('FLEXKV_ENABLE_TRACE', 0))),
     trace_file_path=os.getenv('FLEXKV_TRACE_FILE_PATH', './flexkv_trace.log'),

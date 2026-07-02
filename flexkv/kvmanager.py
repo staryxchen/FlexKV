@@ -124,9 +124,15 @@ class KVManager:
 
     def start(self) -> None:
         if self.enable_mps:
-            # try to start MPS
-            subprocess.run(['nvidia-cuda-mps-control', '-d'], check=False)
-            flexkv_logger.debug("MPS started")
+            # try to start MPS (NVIDIA CUDA MPS only; no-op/no-op-safe elsewhere)
+            try:
+                subprocess.run(['nvidia-cuda-mps-control', '-d'], check=False)
+                flexkv_logger.debug("MPS started")
+            except FileNotFoundError:
+                flexkv_logger.warning(
+                    "nvidia-cuda-mps-control not found; skipping MPS start "
+                    "(expected on non-CUDA/ROCm platforms)"
+                )
 
         if not self.server_client_mode:
             self.kv_task_engine.start()
