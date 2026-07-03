@@ -108,28 +108,73 @@ void transfer_kv_blocks(
   // CE transfer mode (Copy Engine using cudaMemcpyAsync)
   if (use_ce_transfer) {
     int kv_dim = is_mla ? 1 : 2;
+    // Block-merging: when consecutive blocks have contiguous IDs on both
+    // GPU and CPU sides, merge them into a single cudaMemcpyAsync call.
+    // This collapses the innermost loop from O(num_blocks) to O(num_runs).
+    // Only valid when block_stride == chunk_size (LAYERFIRST layouts);
+    // otherwise blocks are not physically contiguous and we fall back.
+    bool can_merge = (cpu_block_stride_in_bytes == chunk_size_in_bytes);
     for (int i = 0; i < num_layers; i++) {
       for (int j = 0; j < kv_dim; j++) {
-        for (int k = 0; k < num_blocks; k++) {
-          int64_t gpu_block_idx = gpu_block_ids[k];
-          int64_t cpu_block_idx = cpu_block_ids[k];
+        if (can_merge) {
+          int k = 0;
+          while (k < num_blocks) {
+            int run_start = k;
+            while (k + 1 < num_blocks &&
+                   gpu_block_ids[k + 1] == gpu_block_ids[k] + 1 &&
+                   cpu_block_ids[k + 1] == cpu_block_ids[k] + 1) {
+              k++;
+            }
 
-          int64_t *cpu_chunk_ptr =
-              cpu_ptr_int64 + (i + start_layer_id) * cpu_layer_stride_int64 +
-              j * cpu_kv_stride_int64 + cpu_block_idx * cpu_block_stride_int64 +
-              cpu_startoff_inside_chunks_int64;
+            int64_t gpu_block_idx = gpu_block_ids[run_start];
+            int64_t cpu_block_idx = cpu_block_ids[run_start];
 
-          int64_t *gpu_ptr = ptr_at<Type>(gpu_tensor_handler,
-                                          i + start_layer_id, j, gpu_block_idx);
-          int64_t *gpu_chunk_ptr = reinterpret_cast<int64_t *>(gpu_ptr) +
-                                   gpu_startoff_inside_chunks_int64;
+            int64_t *cpu_chunk_ptr =
+                cpu_ptr_int64 + (i + start_layer_id) * cpu_layer_stride_int64 +
+                j * cpu_kv_stride_int64 +
+                cpu_block_idx * cpu_block_stride_int64 +
+                cpu_startoff_inside_chunks_int64;
 
-          if (is_host_to_device) {
-            cudaMemcpyAsync(gpu_chunk_ptr, cpu_chunk_ptr, chunk_size_in_bytes,
-                            cudaMemcpyHostToDevice, stream);
-          } else {
-            cudaMemcpyAsync(cpu_chunk_ptr, gpu_chunk_ptr, chunk_size_in_bytes,
-                            cudaMemcpyDeviceToHost, stream);
+            int64_t *gpu_ptr = ptr_at<Type>(
+                gpu_tensor_handler, i + start_layer_id, j, gpu_block_idx);
+            int64_t *gpu_chunk_ptr = reinterpret_cast<int64_t *>(gpu_ptr) +
+                                     gpu_startoff_inside_chunks_int64;
+
+            size_t total_bytes =
+                static_cast<size_t>(k - run_start + 1) * chunk_size_in_bytes;
+
+            if (is_host_to_device) {
+              cudaMemcpyAsync(gpu_chunk_ptr, cpu_chunk_ptr, total_bytes,
+                              cudaMemcpyHostToDevice, stream);
+            } else {
+              cudaMemcpyAsync(cpu_chunk_ptr, gpu_chunk_ptr, total_bytes,
+                              cudaMemcpyDeviceToHost, stream);
+            }
+            k++;
+          }
+        } else {
+          for (int k = 0; k < num_blocks; k++) {
+            int64_t gpu_block_idx = gpu_block_ids[k];
+            int64_t cpu_block_idx = cpu_block_ids[k];
+
+            int64_t *cpu_chunk_ptr =
+                cpu_ptr_int64 + (i + start_layer_id) * cpu_layer_stride_int64 +
+                j * cpu_kv_stride_int64 +
+                cpu_block_idx * cpu_block_stride_int64 +
+                cpu_startoff_inside_chunks_int64;
+
+            int64_t *gpu_ptr = ptr_at<Type>(
+                gpu_tensor_handler, i + start_layer_id, j, gpu_block_idx);
+            int64_t *gpu_chunk_ptr = reinterpret_cast<int64_t *>(gpu_ptr) +
+                                     gpu_startoff_inside_chunks_int64;
+
+            if (is_host_to_device) {
+              cudaMemcpyAsync(gpu_chunk_ptr, cpu_chunk_ptr, chunk_size_in_bytes,
+                              cudaMemcpyHostToDevice, stream);
+            } else {
+              cudaMemcpyAsync(cpu_chunk_ptr, gpu_chunk_ptr, chunk_size_in_bytes,
+                              cudaMemcpyDeviceToHost, stream);
+            }
           }
         }
       }
