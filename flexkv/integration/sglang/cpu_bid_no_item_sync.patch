@@ -1,0 +1,52 @@
+diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend_hip_radix.py b/python/sglang/srt/layers/attention/deepseek_v4_backend_hip_radix.py
+index a1584e8d5..0cdd3b339 100644
+--- a/python/sglang/srt/layers/attention/deepseek_v4_backend_hip_radix.py
++++ b/python/sglang/srt/layers/attention/deepseek_v4_backend_hip_radix.py
+@@ -558,6 +558,7 @@ class DeepseekV4HipRadixBackend(
+             extend_seq_lens,
+             num_tokens,
+             need_compress=need_compress,
++            extend_seq_lens_cpu=extend_seq_lens_cpu,
+         )
+         indexer_metadata = (
+             self.init_forward_metadata_indexer(core_attn_metadata)
+@@ -1124,6 +1125,7 @@ class DeepseekV4HipRadixBackend(
+         extend_seq_lens: torch.Tensor,
+         num_tokens: int,
+         need_compress: bool = True,
++        extend_seq_lens_cpu: Optional[List[int]] = None,
+     ) -> None:
+         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+             is_unified_kv_triton,
+@@ -1136,13 +1138,26 @@ class DeepseekV4HipRadixBackend(
+         seq_lens = seq_lens.to(torch.int64)
+         extend_seq_lens = extend_seq_lens.to(torch.int64)
+         # token -> req index (length L = sum(extend_seq_lens)).
+-        # output_size skips the implicit sum() D2H on draft-extend. dropping it on the
+-        # target-extend path triggers a GPU memory access fault.
++        #
++        # GPU repeat_interleave without output_size forces an implicit
++        # sum()/Tensor.item() D2H sync (memcpy_and_sync). Under concurrent
++        # FlexKV CE GATHER_DIRECT H2D this is the scheduler stack observed in
++        # CE hang captures. Avoid that sync:
++        #   - need_compress (target-extend): build bid on CPU from
++        #     extend_seq_lens_cpu (already available at the call site), then
++        #     non_blocking H2D. Do NOT pass output_size here — SGLang historically
++        #     faults on that path.
++        #   - draft-extend: keep output_size=num_tokens (skips the sync).
+         if need_compress:
++            if extend_seq_lens_cpu is None:
++                # Fallback only if caller omitted CPU lens; still avoids the
++                # aten sum().item() inside GPU repeat_interleave by using a
++                # host list from a blocking .tolist() once.
++                extend_seq_lens_cpu = extend_seq_lens.tolist()
+             bid = torch.repeat_interleave(
+-                torch.arange(bs, device=device, dtype=torch.int64),
+-                extend_seq_lens,
+-            )
++                torch.arange(bs, dtype=torch.int64),
++                torch.tensor(extend_seq_lens_cpu, dtype=torch.int64),
++            ).to(device, non_blocking=True)
+         else:
+             bid = torch.repeat_interleave(
+                 torch.arange(bs, device=device, dtype=torch.int64),

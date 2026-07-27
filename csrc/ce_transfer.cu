@@ -1291,7 +1291,11 @@ void ce_transfer_gather_direct(
         }
       }
     }
-    cudaStreamSynchronize(stream);
+    // No cudaStreamSynchronize here: all staging/GPU ops are enqueued on
+    // ``stream``. Same-stream reuse of cached staging is ordered by the GPU;
+    // layerwise callers pass sync=false and record an event after return.
+    // Host-side stream sync was a forced wait that CE-hang captures showed
+    // stuck under concurrent GATHER_DIRECT storms.
 
   } else {
     // ---- H2D ----
@@ -1371,7 +1375,7 @@ void ce_transfer_gather_direct(
         dst_view.index_copy_(0, gpu_ids_cuda, src_slice);
       }
     }
-    cudaStreamSynchronize(stream);
+    // See D2H branch: rely on same-stream ordering + outer event/sync.
   }
 
   // Release from_blob views (buffers cached).
