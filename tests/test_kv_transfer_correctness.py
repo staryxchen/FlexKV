@@ -149,7 +149,10 @@ CPU_LAYOUTS = [
 ]
 
 ENGINES = (
-    [pytest.param("ce", True, id="ce")]
+    [
+        pytest.param("classic", False, id="classic"),
+        pytest.param("ce", True, id="ce"),
+    ]
     if IS_ROCM
     else [
         pytest.param("cuda", False, id="cuda"),

@@ -6,7 +6,7 @@
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -21,139 +21,9 @@
 #include "monitoring/metrics_manager.h"
 #include "transfer.cuh"
 #include "ce_transfer.h"
+#include "transfer_kernels.cuh"
 
 namespace flexkv {
-
-#define FLOAT4_PTR(ptr) reinterpret_cast<float4 *>(ptr)
-
-constexpr int kFloat4AlignBytes = 16;
-constexpr int kInt64AlignBytes = 8;
-
-static bool use_float4_kernel_path(int64_t chunk_size_in_bytes,
-                                   int64_t gpu_startoff_inside_chunks,
-                                   int64_t cpu_startoff_inside_chunks) {
-  return (chunk_size_in_bytes % kFloat4AlignBytes == 0) &&
-         (gpu_startoff_inside_chunks % kFloat4AlignBytes == 0) &&
-         (cpu_startoff_inside_chunks % kFloat4AlignBytes == 0);
-}
-
-// 8-byte (int64) copy path for MLA-sharded D2H where per-TP shard offsets are
-// 8-aligned but not 16-aligned (e.g. DSv4 bytes_per_page_padded=37440, TP=8).
-template <BackendType Type>
-__global__ void transfer_kv_blocks_kernel_8b(
-    int num_blocks, int start_layer_id, int num_layers, int64_t *gpu_block_ids,
-    GTensorHandler gpu_handler, int64_t gpu_startoff_inside_chunks,
-    int64_t *cpu_block_ids, int64_t *cpu_ptr, int64_t cpu_kv_stride,
-    int64_t cpu_layer_stride, int64_t cpu_block_stride,
-    int64_t cpu_startoff_inside_chunks, int64_t copy_size, bool is_mla,
-    bool is_host_to_device) {
-  int kv_dim = is_mla ? 1 : 2;
-  int num_chunks = num_layers * kv_dim * num_blocks;
-
-  int warp_id = threadIdx.x / 32;
-  int lane_id = threadIdx.x % 32;
-  int warps_per_block = blockDim.x / 32;
-  int total_warps = gridDim.x * warps_per_block;
-
-  for (int chunk_idx = blockIdx.x * warps_per_block + warp_id;
-       chunk_idx < num_chunks; chunk_idx += total_warps) {
-    int layer_idx = start_layer_id + chunk_idx / (num_blocks * kv_dim);
-    int kv_idx = (chunk_idx % (num_blocks * kv_dim)) / num_blocks;
-    int gpu_block_idx = gpu_block_ids[chunk_idx % num_blocks];
-    int cpu_block_idx = cpu_block_ids[chunk_idx % num_blocks];
-
-    int64_t *cpu_chunk_ptr =
-        cpu_ptr + layer_idx * cpu_layer_stride + kv_idx * cpu_kv_stride +
-        cpu_block_idx * cpu_block_stride + cpu_startoff_inside_chunks;
-
-    int64_t *gpu_ptr =
-        ptr_at<Type>(gpu_handler, layer_idx, kv_idx, gpu_block_idx);
-    int64_t *gpu_chunk_ptr =
-        reinterpret_cast<int64_t *>(gpu_ptr) + gpu_startoff_inside_chunks;
-
-    int64_t *src_chunk_ptr = is_host_to_device ? cpu_chunk_ptr : gpu_chunk_ptr;
-    int64_t *dst_chunk_ptr = is_host_to_device ? gpu_chunk_ptr : cpu_chunk_ptr;
-
-    // Use explicit PTX ld/st (same as float4 path) so D2H can write pinned host
-    // memory from device; plain C++ stores may fault on unmapped host pointers.
-    for (int64_t idx = lane_id; idx < copy_size; idx += 32) {
-      int64_t element;
-      asm volatile("ld.global.nc.u64 %0, [%1];"
-                   : "=l"(element)
-                   : "l"(&src_chunk_ptr[idx])
-                   : "memory");
-      asm volatile("st.global.cg.u64 [%0], %1;"
-                   :: "l"(&dst_chunk_ptr[idx]), "l"(element)
-                   : "memory");
-    }
-  }
-}
-
-// Templated CUDA kernel - backend type determined at compile time
-template <BackendType Type>
-__global__ void transfer_kv_blocks_kernel(
-    int num_blocks, int start_layer_id, int num_layers, int64_t *gpu_block_ids,
-    GTensorHandler gpu_handler, int64_t gpu_startoff_inside_chunks,
-    int64_t *cpu_block_ids, int64_t *cpu_ptr, int64_t cpu_kv_stride,
-    int64_t cpu_layer_stride, int64_t cpu_block_stride,
-    int64_t cpu_startoff_inside_chunks, int64_t copy_size, bool is_mla,
-    bool is_host_to_device) {
-  int kv_dim = is_mla ? 1 : 2;
-  // Fold kv_dim into an inner loop so each warp iteration processes all KV
-  // slots of one (layer, block). For non-MLA this halves the outer iteration
-  // count, amortizing setup cost (division, block_ids fetch, layer_idx and
-  // cpu_base compute) over 2x the useful work per warp step. For MLA
-  // (kv_dim=1) it is equivalent to the original code.
-  int num_chunks = num_layers * num_blocks;
-  int64_t copy_size_in_float4 = copy_size * sizeof(int64_t) / sizeof(float4);
-
-  int warp_id = threadIdx.x / 32;
-  int lane_id = threadIdx.x % 32;
-  int warps_per_block = blockDim.x / 32;
-  int total_warps = gridDim.x * warps_per_block;
-
-  for (int chunk_idx = blockIdx.x * warps_per_block + warp_id;
-       chunk_idx < num_chunks; chunk_idx += total_warps) {
-    int layer_idx = start_layer_id + chunk_idx / num_blocks;
-    int block_pos = chunk_idx % num_blocks;
-    int gpu_block_idx = gpu_block_ids[block_pos];
-    int cpu_block_idx = cpu_block_ids[block_pos];
-
-    int64_t *cpu_base = cpu_ptr + layer_idx * cpu_layer_stride +
-                        cpu_block_idx * cpu_block_stride +
-                        cpu_startoff_inside_chunks;
-
-#pragma unroll
-    for (int kv_idx = 0; kv_idx < kv_dim; kv_idx++) {
-      int64_t *cpu_chunk_ptr = cpu_base + kv_idx * cpu_kv_stride;
-
-      // Use template specialization to compute gpu pointer
-      int64_t *gpu_ptr =
-          ptr_at<Type>(gpu_handler, layer_idx, kv_idx, gpu_block_idx);
-      int64_t *gpu_chunk_ptr =
-          reinterpret_cast<int64_t *>(gpu_ptr) + gpu_startoff_inside_chunks;
-
-      int64_t *src_chunk_ptr =
-          is_host_to_device ? cpu_chunk_ptr : gpu_chunk_ptr;
-      int64_t *dst_chunk_ptr =
-          is_host_to_device ? gpu_chunk_ptr : cpu_chunk_ptr;
-
-      for (int64_t idx = lane_id; idx < copy_size_in_float4; idx += 32) {
-        float4 element;
-        asm volatile("ld.global.nc.v4.f32 {%0,%1,%2,%3},[%4];"
-                     : "=f"(element.x), "=f"(element.y), "=f"(element.z),
-                       "=f"(element.w)
-                     : "l"(&FLOAT4_PTR(src_chunk_ptr)[idx])
-                     : "memory");
-        asm volatile("st.global.cg.v4.f32 [%0],{%1,%2,%3,%4};" ::"l"(
-                         &FLOAT4_PTR(dst_chunk_ptr)[idx]),
-                     "f"(element.x), "f"(element.y), "f"(element.z),
-                     "f"(element.w)
-                     : "memory");
-      }
-    }
-  }
-}
 
 // ============================================================================
 // Main host function
@@ -171,9 +41,6 @@ void transfer_kv_blocks(
     int64_t gpu_block_stride_in_bytes, bool sync,
     const CETransferConfig &ce_config) {
 
-  int block_size = 1024;
-  int block_count = transfer_num_cta;
-
   int64_t *cpu_ptr_int64 = reinterpret_cast<int64_t *>(cpu_ptr);
   int64_t cpu_kv_stride_int64 = cpu_kv_stride_in_bytes / sizeof(int64_t);
   int64_t cpu_block_stride_int64 = cpu_block_stride_in_bytes / sizeof(int64_t);
@@ -182,10 +49,6 @@ void transfer_kv_blocks(
       cpu_startoff_inside_chunks / sizeof(int64_t);
   int64_t gpu_startoff_inside_chunks_int64 =
       gpu_startoff_inside_chunks / sizeof(int64_t);
-  int64_t chunk_size_in_int64 = chunk_size_in_bytes / sizeof(int64_t);
-
-  dim3 blockDim(block_size);
-  dim3 gridDim(block_count);
 
   // CE transfer mode
   if (use_ce_transfer) {
@@ -221,8 +84,8 @@ void transfer_kv_blocks(
       // force_path: benchmark only
       CEPath path;
       if (ce_config.force_path >= 0) {
-        TORCH_CHECK(ce_config.force_path <= 5,
-                    "force_path out of range [0,5]: ", ce_config.force_path);
+        TORCH_CHECK(ce_config.force_path <= 4,
+                    "force_path out of range [0,4]: ", ce_config.force_path);
         path = static_cast<CEPath>(ce_config.force_path);
       } else {
         // is_full_block: all layers*kv_dim in one call (rank0_only).
@@ -295,31 +158,32 @@ void transfer_kv_blocks(
               chunk_size_in_bytes, stream, is_host_to_device, analysis,
               ce_config);
           break;
+        default:
+          break;
       }
     }  // end else (path_opt_enabled)
   } else {
-    // Custom kernel transfer. Choose the float4 (16B) vs int64 (8B) copy path
-    // based on alignment; the 8b path handles MLA-sharded D2H where per-TP
-    // shard offsets are 8-aligned but not 16-aligned (e.g. DSv4).
-    const bool float4_path = use_float4_kernel_path(
-        chunk_size_in_bytes, gpu_startoff_inside_chunks,
-        cpu_startoff_inside_chunks);
-
-    if (float4_path) {
-      transfer_kv_blocks_kernel<Type><<<gridDim, blockDim, 0, stream>>>(
-          num_blocks, start_layer_id, num_layers, gpu_block_ids,
-          gpu_tensor_handler, gpu_startoff_inside_chunks_int64, cpu_block_ids,
-          cpu_ptr_int64, cpu_kv_stride_int64, cpu_layer_stride_int64,
-          cpu_block_stride_int64, cpu_startoff_inside_chunks_int64,
-          chunk_size_in_int64, is_mla, is_host_to_device);
-    } else {
-      transfer_kv_blocks_kernel_8b<Type><<<gridDim, blockDim, 0, stream>>>(
-          num_blocks, start_layer_id, num_layers, gpu_block_ids,
-          gpu_tensor_handler, gpu_startoff_inside_chunks_int64, cpu_block_ids,
-          cpu_ptr_int64, cpu_kv_stride_int64, cpu_layer_stride_int64,
-          cpu_block_stride_int64, cpu_startoff_inside_chunks_int64,
-          chunk_size_in_int64, is_mla, is_host_to_device);
-    }
+    // Classic compute-kernel transfer (shared with ROCm).
+    const int kv_dim = is_mla ? 1 : 2;
+    CEAnalysis analysis = analyze_ce_transfer(
+        gpu_block_ids, cpu_block_ids, num_blocks, cpu_block_stride_in_bytes,
+        chunk_size_in_bytes, gpu_block_stride_in_bytes);
+    ce_trace_log(static_cast<int>(Type), is_host_to_device, num_blocks,
+                 start_layer_id, num_layers, is_mla, kv_dim,
+                 chunk_size_in_bytes,
+                 gpu_tensor_handler.gpu_kv_stride * (int64_t)sizeof(int64_t),
+                 gpu_block_stride_in_bytes,
+                 gpu_tensor_handler.gpu_layer_stride * (int64_t)sizeof(int64_t),
+                 cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
+                 cpu_block_stride_in_bytes, gpu_startoff_inside_chunks,
+                 cpu_startoff_inside_chunks, ce_config, analysis,
+                 CEPath::CLASSIC_KERNEL, gpu_block_ids, cpu_block_ids);
+    launch_classic_transfer_kv_blocks<Type>(
+        num_blocks, start_layer_id, num_layers, gpu_block_ids,
+        gpu_tensor_handler, gpu_startoff_inside_chunks, cpu_block_ids,
+        cpu_ptr_int64, cpu_kv_stride_int64, cpu_layer_stride_int64,
+        cpu_block_stride_int64, cpu_startoff_inside_chunks, chunk_size_in_bytes,
+        stream, transfer_num_cta, is_mla, is_host_to_device);
   }
   if (sync) {
     cudaStreamSynchronize(stream);

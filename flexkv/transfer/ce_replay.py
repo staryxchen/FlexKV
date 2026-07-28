@@ -144,13 +144,19 @@ class ReplayResult:
 # Tensor allocation helpers
 # ---------------------------------------------------------------------------
 
-def _allocate_gpu_tensors(entry: CETraceEntry) -> torch.Tensor:
-    """Allocate GPU KV cache and return a CPU int64 tensor of GPU pointers.
+def _allocate_gpu_tensors(
+    entry: CETraceEntry,
+) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    """Allocate GPU KV cache and return (ptr_tensor, keep_alive).
 
     The pointer layout depends on the backend:
       VLLM:   num_layers pointers (one per layer)
       TRTLLM: 1 pointer (shared, indexed by layer_stride)
       SGLANG: num_layers * kv_dim pointers (one per layer+kv pair)
+
+    Callers must retain ``keep_alive`` until the transfer finishes; otherwise
+    the underlying buffers may be freed while ``transfer_kv_blocks`` still
+    holds raw pointers.
     """
     max_gpu_id = max(entry.gpu_block_ids) if entry.gpu_block_ids else 0
     # Each GPU buffer must hold (max_gpu_id + 1) blocks.
@@ -167,24 +173,31 @@ def _allocate_gpu_tensors(entry: CETraceEntry) -> torch.Tensor:
     else:
         num_ptrs = entry.num_layers
 
-    gpu_ptrs = []
+    keep_alive: List[torch.Tensor] = []
     for _ in range(num_ptrs):
         gpu_tensor = torch.empty(gpu_buf_elems, dtype=torch.int64, device="cuda")
-        gpu_ptrs.append(gpu_tensor)
+        keep_alive.append(gpu_tensor)
 
     # Store pointers as CPU int64 tensor.
     ptr_tensor = torch.tensor(
-        [t.data_ptr() for t in gpu_ptrs], dtype=torch.int64
+        [t.data_ptr() for t in keep_alive], dtype=torch.int64
     )
-    return ptr_tensor
+    return ptr_tensor, keep_alive
 
 
 def _allocate_cpu_tensor(entry: CETraceEntry) -> torch.Tensor:
     """Allocate a CPU KV cache tensor (pinned for async DMA)."""
     max_cpu_id = max(entry.cpu_block_ids) if entry.cpu_block_ids else 0
-    # CPU buffer must hold up to (max_cpu_id + 1) blocks, each of
-    # cpu_block_stride bytes, plus space for num_layers.
-    cpu_buf_bytes = (max_cpu_id + 2) * entry.cpu_block_stride
+    # CPU addressing uses both block and layer strides; size for the max of
+    # the two common layouts (block-major vs layer-strided).
+    by_blocks = (max_cpu_id + 2) * entry.cpu_block_stride
+    by_layers = (
+        (entry.start_layer_id + entry.num_layers + 1)
+        * entry.cpu_layer_stride
+        * max(entry.kv_dim, 1)
+        + (max_cpu_id + 2) * entry.chunk_size_in_bytes
+    )
+    cpu_buf_bytes = max(by_blocks, by_layers)
     cpu_buf_elems = (cpu_buf_bytes + 7) // 8
     cpu_tensor = torch.empty(cpu_buf_elems, dtype=torch.int64, pin_memory=True)
     return cpu_tensor
@@ -194,11 +207,36 @@ def _allocate_cpu_tensor(entry: CETraceEntry) -> torch.Tensor:
 # Main replayer
 # ---------------------------------------------------------------------------
 
+def compact_block_ids(entry: CETraceEntry) -> CETraceEntry:
+    """Remap GPU/CPU block IDs into a dense ``0..N-1`` range.
+
+    Production traces often use sparse high block IDs (CPU ids in the tens of
+    thousands).  Naive allocation of ``(max_id+1) * cpu_block_stride`` can
+    request hundreds of GiB of pinned memory and appear to hang.  Compacting
+    preserves transfer *shape* (N blocks, strides, path) for stress replay
+    while keeping buffers tractable.
+
+    Also forces ``start_layer_id=0`` so VLLM ``ptr_at(layer_idx)`` indexes the
+    compact pointer array of length ``num_layers`` (layerwise traces often have
+    ``start_layer_id`` in 0..L-1 with ``num_layers==1``).
+    """
+    n = len(entry.gpu_block_ids)
+    if n == 0:
+        return entry
+    entry.gpu_block_ids = list(range(n))
+    entry.cpu_block_ids = list(range(n))
+    entry.num_blocks = n
+    entry.block_ids_truncated = False
+    entry.start_layer_id = 0
+    return entry
+
+
 class CETraceReplayer:
     """Read a CE trace file and replay transfers with optional overrides."""
 
-    def __init__(self, trace_file: str):
+    def __init__(self, trace_file: str, compact_ids: bool = False):
         self.trace_file = trace_file
+        self.compact_ids = compact_ids
         self.entries: List[CETraceEntry] = []
         self._load()
 
@@ -209,7 +247,10 @@ class CETraceReplayer:
                 if not line:
                     continue
                 try:
-                    self.entries.append(CETraceEntry.from_json(line))
+                    entry = CETraceEntry.from_json(line)
+                    if self.compact_ids:
+                        entry = compact_block_ids(entry)
+                    self.entries.append(entry)
                 except (json.JSONDecodeError, KeyError) as e:
                     flexkv_logger.warning(
                         f"[ce_replay] skipping malformed trace line: {e}"
@@ -288,9 +329,9 @@ class CETraceReplayer:
         elif ce_force_path >= 0:
             path_names = [
                 "CONTIG_DIRECT", "SEGMENT_DIRECT", "SEGMENT_SCATTER",
-                "GATHER_SCATTER", "GATHER_DIRECT", "COMPUTE_KERNEL",
+                "GATHER_SCATTER", "GATHER_DIRECT",
             ]
-            replayed_path = path_names[ce_force_path] if ce_force_path <= 5 else "UNKNOWN"
+            replayed_path = path_names[ce_force_path] if ce_force_path <= 4 else "UNKNOWN"
         else:
             replayed_path = entry.ce_path
 
@@ -309,7 +350,7 @@ class CETraceReplayer:
         cpu_block_id_tensor = torch.tensor(
             entry.cpu_block_ids, dtype=torch.int64
         ).pin_memory()
-        gpu_tensor_ptrs_tensor = _allocate_gpu_tensors(entry)
+        gpu_tensor_ptrs_tensor, gpu_keep_alive = _allocate_gpu_tensors(entry)
         cpu_tensor = _allocate_cpu_tensor(entry)
 
         # Adjust num_blocks if truncated
@@ -346,7 +387,6 @@ class CETraceReplayer:
                 ce_force_path=ce_force_path,
                 ce_enable_memcpy2d=entry.ce_config["enable_memcpy2d"],
                 is_blockfirst=entry.ce_config["is_blockfirst"],
-                ce_kernel_threshold=entry.ce_config.get("kernel_threshold", 0),
             )
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
@@ -354,6 +394,8 @@ class CETraceReplayer:
             elapsed_us = elapsed_ns / 1000.0
             transfer_bytes = num_blocks * entry.num_layers * entry.kv_dim * entry.chunk_size_in_bytes
             bandwidth_gbs = (transfer_bytes / elapsed_ns) * 1e9 if elapsed_ns > 0 else 0.0
+            # Keep buffers alive until after sync (prevent use-after-free).
+            _ = gpu_keep_alive
             return ReplayResult(
                 trace_id=entry.trace_id,
                 direction=entry.direction,
@@ -367,6 +409,7 @@ class CETraceReplayer:
             )
         except Exception as e:
             elapsed_ns = time.perf_counter_ns() - start
+            _ = gpu_keep_alive
             return ReplayResult(
                 trace_id=entry.trace_id,
                 direction=entry.direction,
@@ -405,8 +448,8 @@ class CETraceReplayer:
         results = []
         # Original (auto-select)
         results.append(self.replay(entry_idx=entry_idx))
-        # Each forced path (0-5: CONTIG_DIRECT..COMPUTE_KERNEL)
-        for path_id in range(6):
+        # Each forced path (0-4: CONTIG_DIRECT..GATHER_DIRECT)
+        for path_id in range(5):
             r = self.replay(entry_idx=entry_idx, force_path=path_id)
             results.append(r)
         # PER_BLOCK baseline

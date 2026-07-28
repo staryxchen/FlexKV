@@ -32,15 +32,6 @@ struct CETransferConfig {
   // invocations within one logical batch share the same value. Standalone
   // transfer_kv_blocks() calls leave this at 0.
   int64_t batch_id = 0;
-  // Compute-kernel crossover threshold in bytes (BENCHMARK/DEBUG ONLY).
-  // When total transfer size >= this value, dispatch selects COMPUTE_KERNEL
-  // instead of SDMA. Pure-transfer benchmarks show 1.3x speedup at num_blocks
-  // >= 24, BUT in real inference the compute kernel competes with attention/
-  // MLP kernels for CUs, destroying transfer/compute overlap. CE (SDMA) uses
-  // a dedicated copy engine and is the correct choice for both D2H (async
-  // offload) and H2D (layerwise). Default 0 = keep CE. See
-  // docs/hip_compute_kernel_perf.md.
-  int64_t kernel_threshold = 0;
 };
 enum class CEPath : int {
   PER_BLOCK = -1,       // baseline (path_opt_enabled == false)
@@ -49,7 +40,7 @@ enum class CEPath : int {
   SEGMENT_SCATTER = 2,  // segmented source -> staging + CPU scatter
   GATHER_SCATTER = 3,   // GPU gather -> staging + CPU scatter
   GATHER_DIRECT = 4,    // GPU gather + D2D transform -> direct memcpy (BF, non-sharded only)
-  COMPUTE_KERNEL = 5,   // HIP compute copy kernel (small-transfer SDMA bypass)
+  CLASSIC_KERNEL = 5,   // use_ce=false classic CTA kernel (CUDA/ROCm shared)
 };
 
 // ---- Analysis structs ----
@@ -82,18 +73,6 @@ CEPath choose_path(const CEAnalysis &ce_analysis, const CETransferConfig &ce_con
 
 void *get_cached_host_buffer(size_t size);
 void *get_cached_device_buffer(size_t size, int slot = 0);
-
-// ---- COMPUTE_KERNEL: HIP compute copy kernel (small-transfer SDMA bypass) ----
-template <BackendType Type>
-void ce_compute_kernel_transfer(
-    int num_blocks, int start_layer_id, int num_layers, int kv_dim,
-    int64_t *gpu_block_ids, GTensorHandler gpu_tensor_handler,
-    int64_t gpu_startoff_inside_chunks_int64,
-    int64_t *cpu_block_ids, int64_t *cpu_ptr_int64,
-    int64_t cpu_kv_stride_int64, int64_t cpu_layer_stride_int64,
-    int64_t cpu_block_stride_int64,
-    int64_t cpu_startoff_inside_chunks_int64, int64_t chunk_size_in_bytes,
-    cudaStream_t stream, bool is_host_to_device);
 
 // ---- PER_BLOCK: one memcpy/block, slowest, always-correct ----
 template <BackendType Type>

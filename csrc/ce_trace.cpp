@@ -181,7 +181,7 @@ const char *ce_path_name(CEPath path) {
     case CEPath::SEGMENT_SCATTER: return "SEGMENT_SCATTER";
     case CEPath::GATHER_SCATTER:  return "GATHER_SCATTER";
     case CEPath::GATHER_DIRECT:   return "GATHER_DIRECT";
-    case CEPath::COMPUTE_KERNEL:  return "COMPUTE_KERNEL";
+    case CEPath::CLASSIC_KERNEL:  return "CLASSIC_KERNEL";
     default:                      return "UNKNOWN";
   }
 }
@@ -274,15 +274,14 @@ void ce_trace_log(
   snprintf(buf, sizeof(buf),
            ",\"ce_config\":{\"segment_threshold\":%d,\"path_opt_enabled\":%s,"
            "\"force_path\":%d,\"enable_memcpy2d\":%s,\"is_blockfirst\":%s,"
-           "\"is_mla\":%s,\"batch_id\":%lld,\"kernel_threshold\":%lld}",
+           "\"is_mla\":%s,\"batch_id\":%lld}",
            ce_config.segment_threshold,
            ce_config.path_opt_enabled ? "true" : "false",
            ce_config.force_path,
            ce_config.enable_memcpy2d ? "true" : "false",
            ce_config.is_blockfirst ? "true" : "false",
            ce_config.is_mla ? "true" : "false",
-           (long long)ce_config.batch_id,
-           (long long)ce_config.kernel_threshold);
+           (long long)ce_config.batch_id);
   json += buf;
 
   // CE analysis — booleans + segment count

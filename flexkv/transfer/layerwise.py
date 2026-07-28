@@ -656,7 +656,6 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             ce_enable_memcpy2d=GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d,
             is_blockfirst=(cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST),
             is_mla=self.is_mla,
-            ce_kernel_threshold=GLOBAL_CONFIG_FROM_ENV.transfer_kernel_threshold,
             **self._swa_init_kwargs(),
         )
 
@@ -744,7 +743,6 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             ce_enable_memcpy2d=GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d,
             is_blockfirst=(cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST),
             is_mla=self.is_mla,
-            ce_kernel_threshold=GLOBAL_CONFIG_FROM_ENV.transfer_kernel_threshold,
             **self._swa_init_kwargs(),
         )
 

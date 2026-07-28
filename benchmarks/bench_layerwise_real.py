@@ -8,7 +8,6 @@ actually does in production.
 """
 import argparse
 import statistics
-import time
 
 import torch
 
@@ -22,22 +21,16 @@ def bench_layerwise(num_blocks, num_layers, iters, is_h2d, chunk_size, mode):
     layer_stride = (num_blocks + 10) * block_stride
 
     block_ids = torch.arange(num_blocks, dtype=torch.int64, pin_memory=True)
-    # One GPU tensor per layer (VLLM backend, gpu_block_type=0)
     gpu_tensors = [
         torch.empty(layer_stride * kv_dim // 8, dtype=torch.int64, device="cuda")
         for _ in range(num_layers)
     ]
-    # Pin the ptrs array so GPU can read it directly (like LayerwiseTransferGroup
-    # which uses cudaMallocHost for gpu_blocks_)
     gpu_tensor_ptrs = torch.tensor(
         [t.data_ptr() for t in gpu_tensors], dtype=torch.int64, pin_memory=True)
     total_cpu_elems = layer_stride * kv_dim * num_layers // 8
     cpu_tensor = torch.empty(total_cpu_elems, dtype=torch.int64, pin_memory=True)
 
-    force_path = 5 if mode == "compute_kernel" else -1
-    ce_kt = 32768 if mode == "auto" else 0
-
-    # Create cuda events for per-layer timing
+    use_ce = mode == "sdma"
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
 
@@ -55,18 +48,16 @@ def bench_layerwise(num_blocks, num_layers, iters, is_h2d, chunk_size, mode):
         chunk_size_in_bytes=chunk_size,
         transfer_num_cta=4,
         is_host_to_device=is_h2d,
-        use_ce_transfer=True,
+        use_ce_transfer=use_ce,
         is_mla=True,
         gpu_block_type=0,
         ce_path_opt=True,
         ce_segment_threshold=8,
-        ce_force_path=force_path,
+        ce_force_path=-1,
         ce_enable_memcpy2d=False,
         is_blockfirst=False,
-        ce_kernel_threshold=ce_kt,
     )
 
-    # Warmup
     for _ in range(5):
         for layer in range(num_layers):
             c_ext.transfer_kv_blocks(
@@ -74,7 +65,6 @@ def bench_layerwise(num_blocks, num_layers, iters, is_h2d, chunk_size, mode):
                 sync=False, **kwargs_template)
         torch.cuda.synchronize()
 
-    # Timed runs: measure full layerwise loop (all layers, async)
     times_us = []
     for _ in range(iters):
         torch.cuda.synchronize()
@@ -97,8 +87,6 @@ def main():
     p.add_argument("--iters", type=int, default=50)
     args = p.parse_args()
 
-    # Realistic layerwise scenarios: layer_granularity=1
-    # Per-layer data = num_blocks * chunk_size (MLA, 1024B chunk)
     cases = [
         (4, 32, "4 blk, 32 lyr (4KB/lyr, 128KB total)"),
         (8, 32, "8 blk, 32 lyr (8KB/lyr, 256KB total)"),
@@ -111,9 +99,8 @@ def main():
     ]
 
     results = {}
-    for mode in ["sdma", "compute_kernel", "auto"]:
-        name = {"sdma": "SDMA", "compute_kernel": "COMPUTE_KERNEL",
-                "auto": "AUTO(thr=32768)"}[mode]
+    for mode in ["sdma", "classic"]:
+        name = {"sdma": "CE_SDMA", "classic": "CLASSIC_KERNEL"}[mode]
         print(f"\n{'='*80}")
         print(f"  Mode: {name}  (layer_granularity=1, sync=false, async)")
         print(f"{'='*80}")
@@ -133,19 +120,16 @@ def main():
                 print(f"{label:<45} ERROR: {e}")
             torch.cuda.empty_cache()
 
-    # Print comparison
     print(f"\n{'='*80}")
     print(f"  Comparison (layer_granularity=1, async, pinned metadata)")
     print(f"{'='*80}")
-    print(f"{'Config':<45} {'SDMA H2D':>10} {'CK H2D':>10} {'speedup':>8} {'Auto H2D':>10} {'Auto/SDMA':>10}")
-    print("-" * 100)
+    print(f"{'Config':<45} {'SDMA H2D':>10} {'Classic H2D':>12} {'speedup':>8}")
+    print("-" * 80)
     for _, _, label in cases:
-        sdma_h2d = results["sdma"].get(label, (0,0))[0]
-        ck_h2d = results["compute_kernel"].get(label,(0,0))[0]
-        auto_h2d = results["auto"].get(label, (0,0))[0]
-        h2d_sp = sdma_h2d / ck_h2d if ck_h2d > 0 else 0
-        auto_sp = sdma_h2d / auto_h2d if auto_h2d > 0 else 0
-        print(f"{label:<45} {sdma_h2d:>10.1f} {ck_h2d:>10.1f} {h2d_sp:>7.2f}x {auto_h2d:>10.1f} {auto_sp:>9.2f}x")
+        sdma_h2d = results["sdma"].get(label, (0, 0))[0]
+        cl_h2d = results["classic"].get(label, (0, 0))[0]
+        h2d_sp = sdma_h2d / cl_h2d if cl_h2d > 0 else 0
+        print(f"{label:<45} {sdma_h2d:>10.1f} {cl_h2d:>12.1f} {h2d_sp:>7.2f}x")
     print()
 
 

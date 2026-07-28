@@ -279,6 +279,7 @@ hpp_sources = [
     "csrc/ce_transfer.h",
     "csrc/ce_trace.h",
     "csrc/rocm_utils.h",
+    "csrc/transfer_kernels.cuh",
     "csrc/monitoring/metrics_manager.h",  # Monitoring support
 ]
 
@@ -309,7 +310,7 @@ if IS_ROCM_BUILD:
     # CUDAExtension delegates .cu compilation to hipcc with ROCm PyTorch.  Do
     # not populate CUDA-only architecture flags in this mode; PyTorch resolves
     # PYTORCH_ROCM_ARCH (when set) or the local ROCm target instead.
-    print("Building CE-only ROCm/HIP extension")
+    print("Building ROCm/HIP extension (CE default + classic kernel)")
 else:
     if not os.environ.get("TORCH_CUDA_ARCH_LIST"):
         os.environ["TORCH_CUDA_ARCH_LIST"] = detect_cuda_arch()

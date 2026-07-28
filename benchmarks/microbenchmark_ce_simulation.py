@@ -19,7 +19,7 @@ layout, mode) combination and shows median times across all random rounds.
 Usage:
     python benchmarks/microbenchmark_ce_simulation.py --num-gpus 8 --rounds 50
     python benchmarks/microbenchmark_ce_simulation.py --sizes small medium --layouts bfirst
-    python benchmarks/microbenchmark_ce_simulation.py --skip-kernel   # non-NVIDIA: omit CUDA kernel config
+    python benchmarks/microbenchmark_ce_simulation.py --skip-kernel   # omit classic CTA kernel arm
 """
 
 import argparse
@@ -90,10 +90,15 @@ STRATEGIES = [
     ("MLA-rank_rotate",    True, "rank_rotate"),
 ]
 
+# (label, use_ce, path_opt, force_path)
+# - kernel:    classic CTA kernel (use_ce=False). CUDA PTX / ROCm nontemporal
+#              shared path via transfer_kernels.cuh (CLASSIC_KERNEL).
+# - baseline:  CE PER_BLOCK (path_opt off, force_path ignored).
+# - opt:       CE choose_path auto-select (path_opt on, force_path=-1).
 CE_CONFIGS = [
-    ("kernel",   False, False),  # use_ce, path_opt
-    ("baseline", True,  False),
-    ("opt",      True,  True),
+    ("kernel",    False, False, -1),
+    ("baseline",  True,  False, -1),
+    ("opt",       True,  True,  -1),
 ]
 
 
@@ -153,7 +158,7 @@ def make_cpu_tensor(cpu_layout, num_layers, total_blocks, head_dim, is_mla, num_
 def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
                   ce_path_opt=True, ce_segment_threshold=8,
                   is_mla=False, is_blockfirst=False,
-                  ce_enable_memcpy2d=None):
+                  ce_enable_memcpy2d=None, ce_force_path=-1):
     # Default to the global CE memcpy2d setting (FLEXKV_ENABLE_CE_MEMCPY2D,
     # default ON since the env rename). Pass explicitly to override, e.g.
     # ce_enable_memcpy2d=False to match the pre-rename default-off behavior.
@@ -177,7 +182,8 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
         ce_path_opt=ce_path_opt,
         is_mla=is_mla,
         is_blockfirst=is_blockfirst,
-        ce_enable_memcpy2d=ce_enable_memcpy2d)
+        ce_enable_memcpy2d=ce_enable_memcpy2d,
+        ce_force_path=ce_force_path)
 
 
 def fill_gpu(all_gpu, gpu_id, num_layers, num_blocks, head_dim):
@@ -334,12 +340,11 @@ def run_simulation(args):
     threshold = 8
     cta = 16
 
-    # Effective config list: drop the 'kernel' (CUDA kernel) config when the
-    # --skip-kernel flag is set (non-NVIDIA platforms where the custom kernel
-    # cannot build/run). baseline/opt (CE paths) are always kept.
+    # Effective config list: drop the classic 'kernel' config when
+    # --skip-kernel is set. baseline/opt (CE paths) are always kept.
     configs = [c for c in CE_CONFIGS if not (args.skip_kernel and c[0] == "kernel")]
     if args.skip_kernel:
-        print("[note] --skip-kernel set: omitting 'kernel' (CUDA kernel) config")
+        print("[note] --skip-kernel set: omitting 'kernel' (classic CTA) config")
 
     print("=" * 96)
     print("  CE Transfer Monte Carlo Simulation (controlled random fragmentation)")
@@ -431,13 +436,14 @@ def run_simulation(args):
 
                     # Run all 4 configs for this round's ids
                     round_times = {}
-                    for cfg_label, use_ce, path_opt in configs:
+                    for cfg_label, use_ce, path_opt, force_path in configs:
                         tp = make_tp_group(
                             cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout,
                             num_layers, ce_path_opt=path_opt,
                             ce_segment_threshold=threshold,
                             is_mla=is_mla,
-                            is_blockfirst=(cpu_layout_type == KVCacheLayoutType.BLOCKFIRST))
+                            is_blockfirst=(cpu_layout_type == KVCacheLayoutType.BLOCKFIRST),
+                            ce_force_path=force_path)
 
                         try:
                             d2h_ms = bench_one_dir(
@@ -466,7 +472,7 @@ def run_simulation(args):
                     # Print this round
                     seg_str = "blk={:>5d} seg={:>5d}".format(batch_size, actual_seg)
                     parts = []
-                    for cfg_label, _, _ in configs:
+                    for cfg_label, _, _, _ in configs:
                         t = round_times.get(cfg_label, {})
                         d2h = t.get("d2h")
                         h2d = t.get("h2d")
@@ -508,7 +514,7 @@ def run_simulation(args):
         base_h2d = _median(all_results[combo].get("baseline", {}).get("h2d", []))
         base_rt = _median(all_results[combo].get("baseline", {}).get("rt", []))
 
-        for cfg_label, _, _ in configs:
+        for cfg_label, _, _, _ in configs:
             d2h = _median(all_results[combo][cfg_label]["d2h"])
             h2d = _median(all_results[combo][cfg_label]["h2d"])
             rt = _median(all_results[combo][cfg_label]["rt"])
@@ -555,9 +561,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducibility (default: 42)")
     parser.add_argument("--skip-kernel", action="store_true",
-                        help="Omit the 'kernel' (CUDA kernel) config. Use on "
-                             "non-NVIDIA platforms where the custom CUDA kernel "
-                             "cannot build/run; baseline+opt (CE paths) are kept.")
+                        help="Omit the 'kernel' (classic CTA, use_ce=False) "
+                             "config; baseline/opt (CE paths) are kept.")
     args = parser.parse_args()
 
     num_gpus = NUM_GPUS if args.num_gpus <= 0 else min(args.num_gpus, NUM_GPUS)

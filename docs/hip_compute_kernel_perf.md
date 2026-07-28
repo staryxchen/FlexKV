@@ -1,12 +1,16 @@
 # HIP Compute Kernel 设计文档与性能分析
 
+> **已移除（历史文档）**：CE 内的 `COMPUTE_KERNEL` / `kernel_threshold` /
+> `force_path=5` 路径已删除。CUDA-等价的 compute-kernel 传输请使用
+> `use_ce_transfer=false`（`CLASSIC_KERNEL`，见 `csrc/transfer_kernels.cuh`）。
+> 下文保留为当时 CE 内 CK 路径的性能分析记录。
+
 ## 概述
 
 本方案实现了 HIP compute copy kernel，作为 SDMA (`hipMemcpyAsync`) 的替代路径，
 用于 layerwise 小数据 KV cache 传输。经过实测分析和推理场景建模，**结论是
 compute kernel 方案在实际推理部署中不应启用**，应保持 CE (SDMA) 作为默认传输
-路径。代码保留作为 benchmark/debug 对比用途（`force_path=5` 或
-`kernel_threshold` 仍可手动启用）。
+路径。
 
 ## 测试环境
 
